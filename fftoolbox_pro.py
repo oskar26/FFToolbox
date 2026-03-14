@@ -1,191 +1,325 @@
 #!/usr/bin/env python3
 """
-fftoolbox Pro — Smart Video Converter  v1.1
-===========================================
-Run:  python3 fftoolbox_pro.py
-Cmd:  sudo cp fftoolbox_pro.py /usr/local/bin/fftoolbox && sudo chmod +x /usr/local/bin/fftoolbox
+╔══════════════════════════════════════════════════════════════════╗
+║           fftoolbox Pro  v1.2  —  Smart Media Converter          ║
+║  Video · Audio Extraction · Audio Conversion · DaVinci Fix       ║
+╚══════════════════════════════════════════════════════════════════╝
 
-Requirements: Python 3.8+, ffmpeg + ffprobe in PATH
-License: MIT
+Install as system command:
+  sudo cp fftoolbox_pro.py /usr/local/bin/fftoolbox
+  sudo chmod +x /usr/local/bin/fftoolbox
+  fftoolbox
+
+Requirements: Python 3.8+  ·  ffmpeg + ffprobe in PATH
+License: MIT  ·  https://github.com/yourusername/fftoolbox
 """
 
-import sys, os, re, json, math, time, shutil, tempfile, subprocess, traceback, hashlib
+import sys, os, re, json, time, shutil, tempfile, subprocess, traceback, threading
 from pathlib import Path
 from datetime import timedelta
 from typing import Optional, List, Tuple, Dict, Any
 from urllib.request import urlopen, Request
 from urllib.error import URLError
+from copy import deepcopy
 
 # ── auto-install rich ────────────────────────────────────────────────────────
 def _ensure_rich():
     try:
         import rich
     except ImportError:
-        print("Installing 'rich' …")
+        print("⚙  Installing 'rich' for beautiful UI …")
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "rich", "--quiet"],
+            subprocess.check_call([sys.executable, "-m", "pip", "install",
+                                   "rich", "--quiet", "--break-system-packages"],
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print("Done.\n")
-        except Exception as e:
-            print(f"ERROR: pip install rich failed: {e}\nRun: pip install rich"); sys.exit(1)
+        except Exception:
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install",
+                                       "rich", "--quiet"],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                print(f"ERROR: pip install rich failed: {e}\nRun: pip install rich")
+                sys.exit(1)
+        print("✓  Done.\n")
 _ensure_rich()
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.rule import Rule
-from rich.progress import Progress, BarColumn, TextColumn, TaskProgressColumn, SpinnerColumn
+from rich.progress import (Progress, BarColumn, TextColumn,
+                           TaskProgressColumn, SpinnerColumn, TimeElapsedColumn)
 from rich.prompt import Prompt, Confirm
+from rich.columns import Columns
 from rich import box
 from rich.align import Align
 from rich.markup import escape
+from rich.text import Text
 
 console = Console(highlight=False)
 
-APP_VERSION    = "1.1"
+# ════════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ════════════════════════════════════════════════════════════════════════
+
+APP_VERSION    = "1.2"
 APP_NAME       = "fftoolbox"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/yourusername/fftoolbox/main/VERSION"
-PRESETS_DIR    = Path.home() / ".config" / "fftoolbox" / "presets"
+CONFIG_DIR     = Path.home() / ".config" / "fftoolbox"
+PRESETS_DIR    = CONFIG_DIR / "presets"
+HISTORY_FILE   = CONFIG_DIR / "history.json"
+BITRATE_SAFETY = 0.94   # 94% — ensures output is always UNDER user's target
 
-# File size safety margin: target × SAFETY = actual bitrate target
-# Ensures output never EXCEEDS entered value (container overhead, audio variance, etc.)
-BITRATE_SAFETY = 0.96
-
-WHATSAPP_VIDEO_MB = 100
+WHATSAPP_MB    = 100
+TELEGRAM_MB    = 2048
 
 VIDEO_EXTENSIONS = {
     ".mp4",".mov",".mkv",".m4v",".avi",".wmv",".flv",".webm",
-    ".mxf",".ts",".mts",".m2ts",".mpg",".mpeg",".3gp",".ogv",".dv",".vob",
+    ".mxf",".ts",".mts",".m2ts",".mpg",".mpeg",".3gp",".ogv",
+    ".dv",".vob",".f4v",".rmvb",".asf",
 }
+AUDIO_EXTENSIONS = {
+    ".mp3",".aac",".flac",".wav",".ogg",".opus",".m4a",
+    ".wma",".aiff",".aif",".ape",".mka",".ac3",".eac3",
+}
+ALL_MEDIA = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
+
 PROFESSIONAL_CODECS = {
     "prores","prores_ks","dnxhd","dnxhr","mjpeg","v210",
     "r10k","r210","cineform","cfhd","huffyuv","ffv1","utvideo",
 }
+
 RESOLUTIONS = [
     (None,  None,  "Keep original"),
-    (3840,  2160,  "4K UHD   (3840 x 2160)"),
-    (2560,  1440,  "1440p    (2560 x 1440)"),
-    (1920,  1080,  "1080p    (1920 x 1080)"),
-    (1280,  720,   "720p     (1280 x 720)"),
-    (854,   480,   "480p     (854 x 480)"),
-    (640,   360,   "360p     (640 x 360)"),
-    (426,   240,   "240p     (426 x 240)"),
-    (256,   144,   "144p     (256 x 144)"),
+    (3840,  2160,  "4K UHD   (3840 × 2160)"),
+    (2560,  1440,  "1440p    (2560 × 1440)"),
+    (1920,  1080,  "1080p    (1920 × 1080)"),
+    (1280,  720,   "720p     (1280 × 720)"),
+    (854,   480,   "480p     (854 × 480)"),
+    (640,   360,   "360p     (640 × 360)"),
+    (426,   240,   "240p     (426 × 240)"),
+    (256,   144,   "144p     (256 × 144)"),
 ]
 
+AUDIO_FORMATS = {
+    "mp3":  {"codec":"libmp3lame", "ext":".mp3", "label":"MP3  — universal compatibility"},
+    "aac":  {"codec":"aac",        "ext":".m4a", "label":"AAC  — great quality, small size"},
+    "flac": {"codec":"flac",       "ext":".flac","label":"FLAC — lossless, large files"},
+    "opus": {"codec":"libopus",    "ext":".opus","label":"Opus — best quality/size ratio (modern)"},
+    "wav":  {"codec":"pcm_s16le",  "ext":".wav", "label":"WAV  — uncompressed, DaVinci friendly"},
+    "ogg":  {"codec":"libvorbis",  "ext":".ogg", "label":"OGG  — open source, good quality"},
+}
+
 # ════════════════════════════════════════════════════════════════════════
-# PRESETS
+# VIDEO PRESETS
 # ════════════════════════════════════════════════════════════════════════
+
 PRESETS: Dict[str, Dict[str, Any]] = {
+
+    # ── Smart ────────────────────────────────────────────────────────────
     "smart": {
-        "group":"⭐  Smart","name":"Smart Recommended (auto-optimized)","emoji":"🧠",
-        "desc":"Analyzes your video and computes the ideal CRF + resolution automatically",
+        "group":"⭐  Smart","name":"Smart Auto (analyzes your video)","emoji":"🧠",
+        "desc":"Analyzes codec · bitrate · resolution → computes ideal CRF + resolution",
         "codec":"libx264","crf":None,"speed":"slow","audio_codec":"aac","audio_kbps":128,
         "max_res":None,"target_mb":None,"two_pass":False,"color":"bold cyan",
-        "tip":"Calculates the optimal balance of quality and file size for YOUR specific video.",
+        "tip":"Best all-round choice. Analyzes your specific video before encoding.",
     },
-    "whatsapp": {
-        "group":"📤  Sharing","name":"WhatsApp  (< 100 MB, 720p)","emoji":"📱",
-        "desc":"Two-pass · stays safely under 100 MB · 720p · H.264 · AAC",
-        "codec":"libx264","crf":None,"speed":"slow","audio_codec":"aac","audio_kbps":96,
-        "max_res":(1280,720),"target_mb":95,"two_pass":True,"color":"green",
-        "tip":"WhatsApp video preview limit is 100 MB. Two-pass ensures you stay under.",
-    },
-    "telegram": {
-        "group":"📤  Sharing","name":"Telegram  (1080p, great quality)","emoji":"✈️",
-        "desc":"1080p max · H.264 CRF 22 · AAC 192 · Telegram supports up to 2 GB",
-        "codec":"libx264","crf":22,"speed":"slow","audio_codec":"aac","audio_kbps":192,
-        "max_res":(1920,1080),"target_mb":None,"two_pass":False,"color":"bright_blue",
-        "tip":"Telegram keeps quality intact. Supports up to 2 GB.",
+
+    # ── DaVinci Resolve ──────────────────────────────────────────────────
+    "resolve_audio_fix": {
+        "group":"🎬  DaVinci Resolve","name":"DaVinci Resolve — Fix Audio (Linux)","emoji":"🔧",
+        "desc":"Copies video · converts audio → PCM 48 kHz (fixes Resolve Linux import bug)",
+        "codec":"copy","crf":None,"speed":None,"audio_codec":"pcm_s16le","audio_kbps":None,
+        "max_res":None,"target_mb":None,"two_pass":False,"color":"bold yellow",
+        "tip":"Resolve on Linux often rejects AAC/Opus audio. This converts to PCM — the fix.",
+        "_resolve_fix":True,"_output_ext":".mov",
     },
     "resolve_cleanup": {
-        "group":"🎬  Professional","name":"DaVinci Resolve Cleanup","emoji":"🎬",
-        "desc":"ProRes / DNxHR  ->  H.264 · CRF 18 · near-lossless · keeps 4K",
+        "group":"🎬  DaVinci Resolve","name":"DaVinci Resolve — Cleanup Export","emoji":"🎬",
+        "desc":"ProRes / DNxHR → H.264 · CRF 18 · near-lossless · keeps original resolution",
         "codec":"libx264","crf":18,"speed":"slow","audio_codec":"aac","audio_kbps":192,
         "max_res":None,"target_mb":None,"two_pass":False,"color":"cyan",
-        "tip":"CRF 18 = near-lossless. Shrinks 10 GB Resolve exports to 200–800 MB.",
+        "tip":"Shrinks a 10 GB ProRes export to ~200–800 MB without visible quality loss.",
+    },
+    "resolve_import_ready": {
+        "group":"🎬  DaVinci Resolve","name":"DaVinci Resolve — Import Ready","emoji":"📥",
+        "desc":"H.264 + PCM 48 kHz in MOV container · maximally compatible with Resolve Linux",
+        "codec":"libx264","crf":18,"speed":"slow","audio_codec":"pcm_s16le","audio_kbps":None,
+        "max_res":None,"target_mb":None,"two_pass":False,"color":"bright_cyan",
+        "tip":"Use this to prepare any video for editing in DaVinci Resolve on Linux.",
+        "_output_ext":".mov",
+    },
+
+    # ── Sharing ──────────────────────────────────────────────────────────
+    "whatsapp": {
+        "group":"📤  Sharing","name":"WhatsApp  (< 100 MB, 720p)","emoji":"📱",
+        "desc":"Two-pass · 94% safety margin · 720p max · H.264 · AAC 96 kb/s",
+        "codec":"libx264","crf":None,"speed":"slow","audio_codec":"aac","audio_kbps":96,
+        "max_res":(1280,720),"target_mb":95,"two_pass":True,"color":"green",
+        "tip":"WhatsApp shows video previews up to 100 MB. Two-pass stays safely under.",
+    },
+    "telegram": {
+        "group":"📤  Sharing","name":"Telegram  (1080p, high quality)","emoji":"✈️",
+        "desc":"1080p max · H.264 CRF 22 · AAC 192 kb/s · Telegram supports up to 2 GB",
+        "codec":"libx264","crf":22,"speed":"slow","audio_codec":"aac","audio_kbps":192,
+        "max_res":(1920,1080),"target_mb":None,"two_pass":False,"color":"bright_blue",
+        "tip":"Telegram keeps quality intact. Great for high-quality video sharing.",
+    },
+    "email": {
+        "group":"📤  Sharing","name":"Email Attachment  (< 25 MB)","emoji":"📧",
+        "desc":"Two-pass · stays under 25 MB · 720p · for email clients with size limits",
+        "codec":"libx264","crf":None,"speed":"slow","audio_codec":"aac","audio_kbps":96,
+        "max_res":(1280,720),"target_mb":23,"two_pass":True,"color":"bright_green",
+        "tip":"Most email providers cap attachments at 25 MB. Two-pass hits the target.",
+    },
+
+    # ── Archive / Quality ────────────────────────────────────────────────
+    "archive_h264": {
+        "group":"🗄️  Archive","name":"Archive H.264  (near-lossless)","emoji":"💎",
+        "desc":"CRF 16 · highest H.264 quality · large files · for permanent storage",
+        "codec":"libx264","crf":16,"speed":"slow","audio_codec":"aac","audio_kbps":320,
+        "max_res":None,"target_mb":None,"two_pass":False,"color":"bright_white",
+        "tip":"CRF 16 = near-lossless H.264. Large files but maximum visual fidelity.",
     },
     "archive_h265": {
-        "group":"🎬  Professional","name":"Archive  (H.265 / HEVC)","emoji":"🗄️",
-        "desc":"CRF 18 · ~40 % smaller than H.264 · Apple HVC1 tag · long-term",
+        "group":"🗄️  Archive","name":"Archive H.265  (~40% smaller than H.264)","emoji":"🗄️",
+        "desc":"CRF 18 · HEVC · ~40% smaller than H.264 · Apple HVC1 tag",
         "codec":"libx265","crf":18,"speed":"slow","audio_codec":"aac","audio_kbps":192,
         "max_res":None,"target_mb":None,"two_pass":False,"color":"blue",
-        "tip":"Best long-term archive format. Compatible with modern devices.",
+        "tip":"Best long-term archive. Supported by all modern devices.",
     },
+
+    # ── Web / Social ─────────────────────────────────────────────────────
     "web_1080p": {
-        "group":"🌐  Web","name":"Web / Social Media  (1080p)","emoji":"🌐",
+        "group":"🌐  Web & Social","name":"Web / Social 1080p","emoji":"🌐",
         "desc":"H.264 · CRF 23 · 1080p max · fast-start · YouTube / Vimeo / Instagram",
         "codec":"libx264","crf":23,"speed":"slow","audio_codec":"aac","audio_kbps":128,
         "max_res":(1920,1080),"target_mb":None,"two_pass":False,"color":"yellow",
-        "tip":"Safe choice for any online platform.",
+        "tip":"Safe universal choice for any online platform.",
     },
+    "web_4k": {
+        "group":"🌐  Web & Social","name":"Web 4K (YouTube HDR-ready)","emoji":"🖥️",
+        "desc":"H.264 · CRF 18 · 4K · fast-start · high-bitrate for platform re-encoding",
+        "codec":"libx264","crf":18,"speed":"slow","audio_codec":"aac","audio_kbps":192,
+        "max_res":(3840,2160),"target_mb":None,"two_pass":False,"color":"bright_yellow",
+        "tip":"Upload at maximum quality — YouTube / Vimeo will re-encode anyway.",
+    },
+
+    # ── Compression ──────────────────────────────────────────────────────
     "compress_light": {
-        "group":"📦  Compression","name":"Compress Light  (~25 % smaller)","emoji":"🟢",
-        "desc":"CRF 20 · barely noticeable quality loss · ~25 % smaller",
+        "group":"📦  Compression","name":"Compress Light  (~25% smaller)","emoji":"🟢",
+        "desc":"CRF 20 · barely noticeable quality loss",
         "codec":"libx264","crf":20,"speed":"medium","audio_codec":"aac","audio_kbps":192,
         "max_res":None,"target_mb":None,"two_pass":False,"color":"bright_green",
         "tip":"Almost imperceptible quality difference.",
     },
     "compress_medium": {
-        "group":"📦  Compression","name":"Compress Medium  (~50 % smaller)","emoji":"🟡",
-        "desc":"CRF 26 · noticeable but very watchable · ~50 % smaller",
+        "group":"📦  Compression","name":"Compress Medium  (~50% smaller)","emoji":"🟡",
+        "desc":"CRF 26 · noticeable but very watchable",
         "codec":"libx264","crf":26,"speed":"medium","audio_codec":"aac","audio_kbps":128,
         "max_res":None,"target_mb":None,"two_pass":False,"color":"yellow",
-        "tip":"Good balance of size and quality.",
+        "tip":"Good balance of quality and size reduction.",
     },
     "compress_heavy": {
-        "group":"📦  Compression","name":"Compress Heavy  (~75 % smaller)","emoji":"🔴",
-        "desc":"CRF 32 · clear quality loss · 720p max · ~75 % smaller",
+        "group":"📦  Compression","name":"Compress Heavy  (~75% smaller)","emoji":"🔴",
+        "desc":"CRF 32 · 720p max · clear quality loss",
         "codec":"libx264","crf":32,"speed":"fast","audio_codec":"aac","audio_kbps":64,
         "max_res":(1280,720),"target_mb":None,"two_pass":False,"color":"red",
         "tip":"Maximum compression. Pixelation may be visible.",
     },
+
+    # ── Exact Control ────────────────────────────────────────────────────
     "target_mb": {
-        "group":"🎯  Exact Control","name":"Target Exact File Size  (MB)","emoji":"📐",
-        "desc":"Enter target MB  ->  two-pass · 96 % safety margin · never exceeds target",
+        "group":"🎯  Exact Control","name":"Target Exact Size (MB)","emoji":"📐",
+        "desc":"Enter MB → two-pass · 94% safety margin · never exceeds your target",
         "codec":"libx264","crf":None,"speed":"slow","audio_codec":"aac","audio_kbps":128,
         "max_res":None,"target_mb":None,"two_pass":True,"color":"magenta",
-        "tip":"Uses 96 % safety margin so output is always UNDER your target.",
+        "tip":"Uses 94% safety margin so output is always UNDER your target.",
     },
     "target_percent": {
         "group":"🎯  Exact Control","name":"Target % Compression","emoji":"📊",
-        "desc":"Enter % of original size you want  ->  auto bitrate + two-pass",
+        "desc":"Enter what % of original size you want → auto bitrate + two-pass",
         "codec":"libx264","crf":None,"speed":"slow","audio_codec":"aac","audio_kbps":128,
         "max_res":None,"target_mb":None,"two_pass":True,"color":"magenta",
-        "tip":"E.g. 30  ->  output is ~30 % of original size.",
+        "tip":"E.g. 30 → output will be ~30% of original file size.",
     },
+
+    # ── Utility ──────────────────────────────────────────────────────────
     "quick": {
-        "group":"⚡  Utility","name":"Quick Convert  (fast encode)","emoji":"⚡",
-        "desc":"H.264 · CRF 23 · medium speed",
+        "group":"⚡  Utility","name":"Quick Convert  (medium speed)","emoji":"⚡",
+        "desc":"H.264 · CRF 23 · medium speed · any resolution",
         "codec":"libx264","crf":23,"speed":"medium","audio_codec":"aac","audio_kbps":128,
         "max_res":None,"target_mb":None,"two_pass":False,"color":"bright_yellow",
-        "tip":"Fast encode. Good quality. Ideal for batch jobs.",
+        "tip":"Fast encode with good quality. Great for batch jobs.",
     },
     "fix_audio": {
-        "group":"⚡  Utility","name":"Fix Audio  (copy video)","emoji":"🔊",
-        "desc":"Video stream copied unchanged · audio  ->  AAC 192 · instant",
+        "group":"⚡  Utility","name":"Fix Audio  (copy video stream)","emoji":"🔊",
+        "desc":"Video copied unchanged · audio → AAC 192 kb/s · almost instant",
         "codec":"copy","crf":None,"speed":None,"audio_codec":"aac","audio_kbps":192,
         "max_res":None,"target_mb":None,"two_pass":False,"color":"white",
-        "tip":"Almost instant — only audio is processed.",
+        "tip":"Almost instant — only audio is processed. Fixes codec compatibility issues.",
     },
+    "strip_audio": {
+        "group":"⚡  Utility","name":"Strip Audio  (video only, no sound)","emoji":"🔇",
+        "desc":"Remove all audio tracks · video copied unchanged · instant",
+        "codec":"copy","crf":None,"speed":None,"audio_codec":None,"audio_kbps":None,
+        "max_res":None,"target_mb":None,"two_pass":False,"color":"dim white",
+        "tip":"Creates a silent video. Useful for background loops, memes, etc.",
+        "_no_audio":True,
+    },
+
+    # ── Custom ───────────────────────────────────────────────────────────
     "custom": {
         "group":"⚙️   Custom","name":"Custom — full manual control","emoji":"⚙️",
-        "desc":"Configure every parameter yourself",
+        "desc":"Configure codec · CRF · speed · resolution · audio · hardware encoders",
         "codec":None,"crf":None,"speed":None,"audio_codec":None,"audio_kbps":None,
         "max_res":None,"target_mb":None,"two_pass":False,"color":"dim white",
-        "tip":"Full control: codec, CRF, speed, resolution, audio, hardware encoders.",
+        "tip":"Full manual control over every encoding parameter.",
     },
 }
+
+# ════════════════════════════════════════════════════════════════════════
+# HISTORY / RECENT FILES
+# ════════════════════════════════════════════════════════════════════════
+
+def load_history() -> Dict[str, Any]:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if HISTORY_FILE.exists():
+            return json.loads(HISTORY_FILE.read_text())
+    except Exception:
+        pass
+    return {"recent_files": [], "recent_dirs": [], "last_output_dir": None}
+
+def save_history(h: Dict[str, Any]) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        HISTORY_FILE.write_text(json.dumps(h, indent=2))
+    except Exception:
+        pass
+
+def add_to_history(h: Dict[str, Any], files: List[str], output_dir: str) -> None:
+    for f in files:
+        d = str(Path(f).parent)
+        if d not in h["recent_dirs"]:
+            h["recent_dirs"].insert(0, d)
+        if f not in h["recent_files"]:
+            h["recent_files"].insert(0, f)
+    h["recent_dirs"]  = h["recent_dirs"][:10]
+    h["recent_files"] = h["recent_files"][:20]
+    h["last_output_dir"] = output_dir
+    save_history(h)
 
 # ════════════════════════════════════════════════════════════════════════
 # SYSTEM / FFPROBE HELPERS
 # ════════════════════════════════════════════════════════════════════════
 
-def check_deps():
+def check_deps() -> Tuple[bool, bool]:
     return bool(shutil.which("ffmpeg")), bool(shutil.which("ffprobe"))
 
 def run_ffprobe(path: str) -> Optional[dict]:
-    cmd = ["ffprobe","-v","error","-print_format","json","-show_format","-show_streams",path]
+    cmd = ["ffprobe","-v","error","-print_format","json",
+           "-show_format","-show_streams",path]
     try:
         r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            check=True, text=True, timeout=30)
@@ -193,7 +327,7 @@ def run_ffprobe(path: str) -> Optional[dict]:
     except subprocess.TimeoutExpired:
         console.print("[red]  ffprobe timed out[/]"); return None
     except (json.JSONDecodeError, subprocess.CalledProcessError) as e:
-        console.print(f"[red]  ffprobe failed: {str(e)[:120]}[/]"); return None
+        console.print(f"[red]  ffprobe error: {str(e)[:100]}[/]"); return None
 
 def video_stream(info: dict) -> Optional[dict]:
     for s in info.get("streams",[]):
@@ -208,9 +342,12 @@ def audio_stream(info: dict) -> Optional[dict]:
 def all_audio_streams(info: dict) -> List[dict]:
     return [s for s in info.get("streams",[]) if s.get("codec_type") == "audio"]
 
+def subtitle_streams(info: dict) -> List[dict]:
+    return [s for s in info.get("streams",[]) if s.get("codec_type") == "subtitle"]
+
 def file_duration(info: dict) -> float:
     vs = video_stream(info)
-    if vs and vs.get("duration"):
+    if vs:
         try: return float(vs["duration"])
         except: pass
     try: return float(info.get("format",{}).get("duration") or 0)
@@ -219,6 +356,14 @@ def file_duration(info: dict) -> float:
 def file_size_bytes(info: dict) -> int:
     try: return int(info.get("format",{}).get("size") or 0)
     except: return 0
+
+def is_audio_only(info: dict) -> bool:
+    return video_stream(info) is None and audio_stream(info) is not None
+
+def is_professional(info: dict) -> bool:
+    vs = video_stream(info)
+    vc = (vs or {}).get("codec_name","").lower()
+    return any(p in vc for p in PROFESSIONAL_CODECS)
 
 def safe_int(val, default=0) -> int:
     try: return int(val)
@@ -242,14 +387,8 @@ def fps_str(vs: dict) -> str:
     raw = vs.get("r_frame_rate","")
     try:
         n, d = raw.split("/")
-        v = int(n)/int(d)
-        return f"{v:.3g} fps"
+        return f"{int(n)/int(d):.3g} fps"
     except: return raw or "?"
-
-def is_professional(info: dict) -> bool:
-    vs = video_stream(info)
-    vc = (vs or {}).get("codec_name","").lower()
-    return any(p in vc for p in PROFESSIONAL_CODECS)
 
 def scale_vf(src_w: int, src_h: int, max_res: Tuple[int,int]) -> Optional[str]:
     mw, mh = max_res
@@ -259,17 +398,10 @@ def scale_vf(src_w: int, src_h: int, max_res: Tuple[int,int]) -> Optional[str]:
     nh = (int(src_h*ratio)//2)*2
     return f"scale={nw}:{nh}:flags=lanczos"
 
-def target_video_kbps(target_mb: float, duration_s: float, audio_kbps: int,
-                      safety: float = BITRATE_SAFETY) -> int:
-    """
-    Compute video bitrate to stay UNDER target_mb.
-    - safety=0.96 means we target 96% of desired bitrate
-    - This accounts for container overhead, B-frame overhead, audio variance
-    Result is always safe margin below the user's specified target.
-    """
-    bits    = target_mb * 8 * 1024 * 1024 * safety
-    kbps_t  = bits / max(duration_s, 1) / 1000
-    return max(80, int(kbps_t - audio_kbps))
+def target_video_kbps(target_mb: float, duration_s: float,
+                      audio_kbps: int, safety: float = BITRATE_SAFETY) -> int:
+    bits   = target_mb * 8 * 1024 * 1024 * safety
+    return max(80, int(bits / max(duration_s, 1) / 1000 - audio_kbps))
 
 def parse_progress_time(line: str) -> Optional[float]:
     m = re.search(r"time=(\d+):(\d+):([\d.]+)", line)
@@ -280,7 +412,11 @@ def parse_progress_time(line: str) -> Optional[float]:
 # HARDWARE ENCODER DETECTION + FALLBACK
 # ════════════════════════════════════════════════════════════════════════
 
+_HW_CACHE: Optional[List[Tuple[str,str]]] = None
+
 def detect_hw_encoders() -> List[Tuple[str,str]]:
+    global _HW_CACHE
+    if _HW_CACHE is not None: return _HW_CACHE
     candidates = [
         ("h264_nvenc","NVIDIA NVENC H.264"),("hevc_nvenc","NVIDIA NVENC H.265"),
         ("h264_vaapi","VAAPI H.264 (Intel/AMD)"),("hevc_vaapi","VAAPI H.265 (Intel/AMD)"),
@@ -293,204 +429,141 @@ def detect_hw_encoders() -> List[Tuple[str,str]]:
         r = subprocess.run(["ffmpeg","-hide_banner","-encoders"],
                            stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=5)
         out = r.stdout
-        return [(e,l) for e,l in candidates if e in out]
-    except: return []
+        _HW_CACHE = [(e,l) for e,l in candidates if e in out]
+    except: _HW_CACHE = []
+    return _HW_CACHE
 
-def hw_encoder_fallback(preferred_codec: str, input_path: str) -> str:
-    """
-    Test if a hardware encoder actually works with a 1-second probe encode.
-    Falls back to libx264/libx265 if HW encoder fails.
-    Returns the encoder that will actually work.
-    """
-    hw_names = {"nvenc","vaapi","qsv","videotoolbox","amf"}
-    if not any(h in preferred_codec for h in hw_names):
-        return preferred_codec  # software encoder, no test needed
-
-    console.print(f"  [dim]Testing hardware encoder {preferred_codec} …[/]")
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
-        tmp_out = tf.name
+def hw_fallback(codec: str, input_path: str) -> str:
+    """Test HW encoder; fallback to libx264/libx265 if it fails."""
+    HW = {"nvenc","vaapi","qsv","videotoolbox","amf"}
+    if not any(h in codec for h in HW): return codec
+    console.print(f"  [dim]Testing {codec} …[/]", end="")
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf: tmp = tf.name
     try:
-        test_cmd = [
-            "ffmpeg","-hide_banner","-y","-i",input_path,
-            "-t","1","-vf","scale=320:180",
-            "-c:v",preferred_codec,"-an",tmp_out,
-        ]
-        r = subprocess.run(test_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        r = subprocess.run(
+            ["ffmpeg","-hide_banner","-y","-i",input_path,"-t","1",
+             "-vf","scale=320:180","-c:v",codec,"-an",tmp],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
         if r.returncode == 0:
-            console.print(f"  [green]  HW encoder {preferred_codec} OK[/]")
-            return preferred_codec
-        else:
-            raise RuntimeError("non-zero exit")
+            console.print(" [green]OK[/]"); return codec
+        raise RuntimeError()
     except Exception:
-        # Determine fallback
-        fallback = "libx265" if "hevc" in preferred_codec else "libx264"
-        console.print(f"  [yellow]  HW encoder failed — falling back to {fallback}[/]")
-        return fallback
+        fb = "libx265" if "hevc" in codec else "libx264"
+        console.print(f" [yellow]failed → {fb}[/]"); return fb
     finally:
-        try: os.unlink(tmp_out)
+        try: os.unlink(tmp)
         except: pass
 
 # ════════════════════════════════════════════════════════════════════════
-# SMART PRESET — auto-compute optimal CRF + resolution
+# SMART PRESET ANALYSIS
 # ════════════════════════════════════════════════════════════════════════
 
 def compute_smart_preset(info: dict) -> dict:
-    """
-    Analyzes source video and returns a custom preset with optimal CRF and resolution.
-    Logic:
-      - Estimate effective bitrate per pixel
-      - If source is already well-compressed → use copy-ish CRF
-      - If source is bloated (ProRes/uncompressed) → aggressive CRF
-      - Pick resolution that makes sense for the bitrate
-    """
-    preset  = dict(PRESETS["smart"])
-    vs      = video_stream(info)
-    dur     = file_duration(info)
-    sz      = file_size_bytes(info)
-    src_w   = safe_int((vs or {}).get("width",1920))
-    src_h   = safe_int((vs or {}).get("height",1080))
-    src_bps = safe_int((vs or {}).get("bit_rate")) or (sz*8/max(dur,1) if dur>0 else 0)
+    preset = deepcopy(PRESETS["smart"])
+    vs     = video_stream(info)
+    dur    = file_duration(info)
+    sz     = file_size_bytes(info)
+    src_w  = safe_int((vs or {}).get("width",  1920))
+    src_h  = safe_int((vs or {}).get("height", 1080))
+    src_bps = safe_int((vs or {}).get("bit_rate")) or (sz*8/max(dur,1))
     src_kbps = src_bps / 1000
+    pixels   = max(src_w * src_h, 1)
+    bpp      = src_kbps / pixels  # bits per pixel per second
 
-    # Bits per pixel per second (bpp) — measure of compression efficiency
-    pixels   = src_w * src_h
-    bpp      = src_kbps / pixels if pixels > 0 else 0
+    # CRF based on how compressed the source already is
+    if bpp > 0.5:   crf = 18    # very uncompressed (ProRes/raw)
+    elif bpp > 0.1: crf = 20
+    elif bpp > 0.04: crf = 22
+    elif bpp > 0.02: crf = 24
+    else:           crf = 26    # already heavily compressed
 
-    # CRF selection based on source compression level
-    if bpp > 0.5:          # very uncompressed (ProRes, raw) → aggressive
-        crf = 18
-    elif bpp > 0.1:        # mildly compressed
-        crf = 20
-    elif bpp > 0.04:       # typical camera h264
-        crf = 22
-    elif bpp > 0.02:       # already well compressed
-        crf = 24
-    else:                  # very low bitrate source
-        crf = 26
-
-    # Resolution: if 4K at low bpp → recommend 1080p
-    recommended_res = None
+    # Resolution recommendation
+    rec_res = None
+    reason  = ""
     if src_w >= 3840 and bpp < 0.05:
-        recommended_res = (1920, 1080)
-        console.print("  [dim]Smart: 4K source at low bitrate → recommending 1080p downscale[/]")
+        rec_res = (1920,1080); reason = "4K @ low bitrate → 1080p"
     elif src_w >= 2560 and bpp < 0.04:
-        recommended_res = (1920, 1080)
-        console.print("  [dim]Smart: 1440p source at moderate bitrate → recommending 1080p[/]")
+        rec_res = (1920,1080); reason = "1440p @ low bitrate → 1080p"
     elif src_w >= 1920 and src_kbps < 1500:
-        recommended_res = (1280, 720)
-        console.print("  [dim]Smart: 1080p source at low bitrate → recommending 720p[/]")
+        rec_res = (1280,720);  reason = "1080p @ low bitrate → 720p"
 
-    # Estimated output size
-    if dur > 0:
-        # Estimate output kbps with H.264 at chosen CRF
-        # Rule of thumb: CRF 18 ≈ 60% of uncompressed, CRF 23 ≈ 30%
-        est_ratio  = 0.6 * (0.75 ** (crf - 18))  # rough exponential scaling
-        est_kbps   = src_kbps * est_ratio
-        est_mb     = est_kbps * 1000 * dur / (8 * 1024 * 1024)
-        console.print(
-            f"  [dim]Smart analysis: source {src_kbps:.0f} kb/s · bpp={bpp:.4f} · "
-            f"recommended CRF {crf} → est. ~{est_mb:.0f} MB[/]"
-        )
+    # Estimate output size
+    est_ratio = 0.55 * (0.75 ** (crf - 18))
+    est_kbps  = src_kbps * est_ratio
+    est_mb    = est_kbps * 1000 * dur / (8*1024*1024) if dur > 0 else 0
 
-    preset["crf"]     = crf
-    preset["max_res"] = recommended_res
-    preset["speed"]   = "slow"
+    rows = [
+        ("Source bitrate",     f"{src_kbps:.0f} kb/s"),
+        ("Bits/pixel/s",       f"{bpp:.5f}"),
+        ("Chosen CRF",         f"{crf}"),
+        ("Resolution",         reason if reason else "keep original"),
+        ("Estimated output",   f"~{est_mb:.0f} MB" if est_mb > 0 else "unknown"),
+    ]
+    tbl = Table(box=box.ROUNDED, border_style="dim", show_header=False, padding=(0,1))
+    tbl.add_column("K", style="cyan", width=18); tbl.add_column("V")
+    for k, v in rows: tbl.add_row(k, v)
+    console.print(Panel(tbl, title="[bold]Smart Analysis[/]", border_style="cyan"))
+
+    preset["crf"]       = crf
+    preset["max_res"]   = rec_res
+    preset["speed"]     = "slow"
     preset["audio_codec"]  = "aac"
     preset["audio_kbps"]   = 128
-    preset["two_pass"]     = False
-    preset["_smart_crf"]   = crf
-    preset["_smart_res"]   = recommended_res
-
     return preset
 
 # ════════════════════════════════════════════════════════════════════════
-# SMART RESOLUTION RECOMMENDATION for target-size presets
+# SMART RESOLUTION RECOMMENDATION
 # ════════════════════════════════════════════════════════════════════════
 
-def recommend_resolution_for_target(target_mb: float, duration_s: float,
-                                    audio_kbps: int, src_w: int, src_h: int
-                                    ) -> Tuple[Optional[Tuple[int,int]], str]:
-    """
-    Given a target file size, compute the optimal resolution.
-    Returns (resolution_tuple_or_None, explanation_string)
-    """
-    if duration_s <= 0:
-        return None, "Cannot compute — unknown duration"
-
+def recommend_resolution(target_mb: float, duration_s: float,
+                         audio_kbps: int, src_w: int, src_h: int
+                         ) -> Tuple[Optional[Tuple[int,int]], str]:
+    if duration_s <= 0: return None, "unknown duration"
     vkbps = target_video_kbps(target_mb, duration_s, audio_kbps)
-
-    # Minimum acceptable bpp for good-looking H.264:
-    # 720p needs ~500+ kb/s, 1080p needs ~1500+ kb/s, 4K needs ~8000+ kb/s
     thresholds = [
-        (3840, 2160, 8000, "4K"),
-        (2560, 1440, 4000, "1440p"),
-        (1920, 1080, 1500, "1080p"),
-        (1280, 720,  500,  "720p"),
-        (854,  480,  200,  "480p"),
-        (640,  360,  100,  "360p"),
+        (3840,2160,8000,"4K"),(2560,1440,4000,"1440p"),
+        (1920,1080,1500,"1080p"),(1280,720,500,"720p"),
+        (854,480,200,"480p"),(640,360,100,"360p"),
     ]
-    best_res = None
-    best_label = "360p"
-    for w, h, min_kbps, label in thresholds:
-        if vkbps >= min_kbps and src_w >= w and src_h >= h:
-            best_res   = (w, h) if (w < src_w or h < src_h) else None
-            best_label = label
-            break
-
-    explanation = (
-        f"video ~{vkbps} kb/s at {target_mb:.0f} MB → "
-        f"recommended: [bold]{best_label}[/]"
-        + (f" ({best_res[0]}x{best_res[1]})" if best_res else " (keep original)")
-    )
-    return best_res, explanation
+    for w, h, min_k, label in thresholds:
+        if vkbps >= min_k and src_w >= w and src_h >= h:
+            res = (w,h) if (w < src_w or h < src_h) else None
+            return res, f"~{vkbps} kb/s → [bold]{label}[/] recommended"
+    return (640,360), f"~{vkbps} kb/s very low → [yellow]360p[/] minimum"
 
 # ════════════════════════════════════════════════════════════════════════
-# ENCODING PREVIEW (5-second test clip)
+# PREVIEW ENCODE (5-second test clip with PSNR)
 # ════════════════════════════════════════════════════════════════════════
 
-def run_preview_encode(input_path: str, preset: dict, info: dict) -> bool:
-    """
-    Encode a 5-second clip from the middle of the video.
-    Shows resulting file size, estimated PSNR quality.
-    Returns True if user wants to proceed with full encode.
-    """
-    dur = file_duration(info)
-    vs  = video_stream(info)
+def run_preview(input_path: str, preset: dict, info: dict) -> bool:
+    dur   = file_duration(info)
+    vs    = video_stream(info)
     src_w = safe_int((vs or {}).get("width",1920))  if vs else 1920
     src_h = safe_int((vs or {}).get("height",1080)) if vs else 1080
 
-    # Start at 30% of video (skip intros)
-    start  = max(0, dur * 0.3)
-    length = min(5.0, dur * 0.1, 10.0)
+    start  = max(0.0, dur * 0.3)
+    length = min(5.0, max(1.0, dur * 0.1))
+    if length < 0.5:
+        console.print("  [dim]Video too short for preview.[/]"); return True
 
-    if length < 1:
-        console.print("  [dim]Video too short for preview — skipping[/]")
-        return True
-
-    console.print(f"\n  [bold cyan]Preview Encode[/]  [dim](encoding {length:.0f}s from {human_dur(start)})[/]")
-
-    tmpdir   = tempfile.mkdtemp(prefix="fftoolbox_preview_")
-    tmp_in   = input_path
-    tmp_out  = os.path.join(tmpdir, "preview.mp4")
-    tmp_ref  = os.path.join(tmpdir, "reference.mp4")
+    console.print(f"\n  [bold cyan]Preview Encode[/]  [dim]({length:.0f}s starting at {human_dur(start)})[/]")
+    tmpdir = tempfile.mkdtemp(prefix="fftoolbox_prev_")
+    tmp_out = os.path.join(tmpdir, "preview.mp4")
+    tmp_ref = os.path.join(tmpdir, "reference.mp4")
 
     try:
-        # Build command — same as full encode but with time limit
-        from copy import deepcopy
-        p2    = deepcopy(preset)
-        p2["two_pass"] = False  # no two-pass for preview
-        if p2.get("target_mb"):
-            # Estimate CRF for preview
-            p2["crf"]       = 23
-            p2["target_mb"] = None
+        p2 = deepcopy(preset)
+        p2["two_pass"] = False
+        if p2.get("target_mb"): p2["crf"] = 23; p2["target_mb"] = None
 
         vf_list = build_vf_list(p2, src_w, src_h)
+        co = p2.get("codec") or "libx264"
+        if co in ("copy", None): co = "libx264"; p2["crf"] = 22
+
         cmd = ["ffmpeg","-hide_banner","-y","-ss",str(start),"-t",str(length),"-i",input_path]
-        if vf_list: cmd += ["-vf",",".join(vf_list)]
+        if vf_list: cmd += ["-vf", ",".join(vf_list)]
         cmd += ["-map","0:v","-map","0:a?"]
 
-        co = p2.get("codec") or "libx264"
-        if co == "copy" or co is None: co = "libx264"
         if co == "libx264":
             cmd += ["-c:v","libx264","-profile:v","high","-pix_fmt","yuv420p"]
         elif co == "libx265":
@@ -498,122 +571,200 @@ def run_preview_encode(input_path: str, preset: dict, info: dict) -> bool:
         else:
             cmd += ["-c:v",co,"-pix_fmt","yuv420p"]
 
-        crf = p2.get("crf") or 23
-        cmd += ["-crf",str(crf)]
-        sp  = p2.get("speed") or "fast"
-        if not any(h in co for h in {"nvenc","vaapi","qsv","videotoolbox","amf"}):
-            cmd += ["-preset",sp]
+        cmd += ["-crf", str(p2.get("crf",23))]
+        sp = p2.get("speed") or "fast"
+        HW = {"nvenc","vaapi","qsv","videotoolbox","amf"}
+        if not any(h in co for h in HW): cmd += ["-preset", sp]
 
         ac = p2.get("audio_codec") or "aac"
         ab = p2.get("audio_kbps") or 128
-        if ac not in ("copy","flac"): cmd += ["-c:a",ac,"-b:a",f"{ab}k"]
-        else: cmd += ["-c:a",ac]
-
+        if ac not in ("copy","flac","pcm_s16le","pcm_s24le"):
+            cmd += ["-c:a", ac, "-b:a", f"{ab}k"]
+        else:
+            cmd += ["-c:a", ac]
         cmd += [tmp_out]
 
-        with console.status("[cyan]Encoding preview …[/]"):
-            r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+        with console.status("[cyan]Encoding preview clip …[/]"):
+            r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=120)
 
         if r.returncode != 0 or not os.path.exists(tmp_out):
-            console.print("  [yellow]Preview encode failed — continuing with full encode[/]")
-            return True
+            console.print("  [yellow]Preview failed — continuing anyway.[/]"); return True
 
         prev_sz   = os.path.getsize(tmp_out)
-        prev_kbps = (prev_sz*8/length/1000) if length > 0 else 0
+        prev_kbps = prev_sz * 8 / length / 1000
 
-        # Estimate full output size based on preview bitrate
-        if preset.get("target_mb"):
-            est_full_mb = preset["target_mb"]
-        elif dur > 0:
-            est_full_mb = prev_kbps * 1000 * dur / (8*1024*1024)
-        else:
-            est_full_mb = 0
+        # Estimate full output
+        est_mb = (preset.get("target_mb") or
+                  (prev_kbps * 1000 * dur / (8*1024*1024) if dur > 0 else 0))
 
-        # Try to get PSNR via ffmpeg (quick reference encode at high quality)
+        # PSNR via ffmpeg (optional)
         psnr_str = ""
         try:
-            ref_cmd = ["ffmpeg","-hide_banner","-y","-ss",str(start),"-t",str(length),
-                       "-i",input_path,"-c:v","libx264","-crf","0","-preset","ultrafast",
-                       "-an",tmp_ref]
-            rr = subprocess.run(ref_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            with console.status("[dim]Computing quality …[/]"):
+                ref_cmd = ["ffmpeg","-hide_banner","-y","-ss",str(start),"-t",str(length),
+                           "-i",input_path,"-c:v","libx264","-crf","0",
+                           "-preset","ultrafast","-an",tmp_ref]
+                rr = subprocess.run(ref_cmd, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, timeout=30)
             if rr.returncode == 0:
-                psnr_cmd = ["ffmpeg","-hide_banner","-i",tmp_out,"-i",tmp_ref,
-                            "-lavfi","psnr","-f","null","-"]
-                pr = subprocess.run(psnr_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                    text=True, timeout=30)
+                pr = subprocess.run(
+                    ["ffmpeg","-hide_banner","-i",tmp_out,"-i",tmp_ref,
+                     "-lavfi","psnr","-f","null","-"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    text=True, timeout=30)
                 m = re.search(r"average:([\d.]+)", pr.stderr)
                 if m:
-                    psnr_val = float(m.group(1))
-                    if psnr_val >= 45:   quality = "[green]Excellent[/]"
-                    elif psnr_val >= 40: quality = "[green]Very Good[/]"
-                    elif psnr_val >= 35: quality = "[yellow]Good[/]"
-                    elif psnr_val >= 30: quality = "[yellow]Acceptable[/]"
-                    else:                quality = "[red]Poor[/]"
-                    psnr_str = f"  PSNR {psnr_val:.1f} dB = {quality}"
-        except Exception:
-            pass  # PSNR is optional
+                    v = float(m.group(1))
+                    q = ("[bold green]Excellent[/]" if v >= 45 else
+                         "[green]Very Good[/]" if v >= 40 else
+                         "[yellow]Good[/]" if v >= 35 else
+                         "[yellow]Acceptable[/]" if v >= 30 else
+                         "[red]Poor[/]")
+                    psnr_str = f"{v:.1f} dB — {q}"
+        except Exception: pass
 
-        # Show results
         tbl = Table(box=box.ROUNDED, border_style="dim", show_header=False, padding=(0,1))
-        tbl.add_column("K", style="bold cyan", width=20)
-        tbl.add_column("V")
-        tbl.add_row("Preview duration",  f"{length:.0f}s")
-        tbl.add_row("Preview size",       human_size(prev_sz))
-        tbl.add_row("Preview bitrate",    f"{prev_kbps:.0f} kb/s")
-        if est_full_mb > 0:
-            clr = "green" if not preset.get("target_mb") or est_full_mb <= preset["target_mb"] else "yellow"
-            tbl.add_row("Estimated full output", f"[{clr}]~{est_full_mb:.0f} MB[/]")
+        tbl.add_column("K", style="bold cyan", width=20); tbl.add_column("V")
+        tbl.add_row("Preview clip",      f"{length:.0f}s")
+        tbl.add_row("Preview size",      human_size(prev_sz))
+        tbl.add_row("Bitrate (preview)", f"{prev_kbps:.0f} kb/s")
+        if est_mb > 0:
+            clr = "green" if not preset.get("target_mb") or est_mb <= preset["target_mb"] else "yellow"
+            tbl.add_row("Est. full output", f"[{clr}]~{est_mb:.0f} MB[/]")
         if psnr_str:
             tbl.add_row("Quality (PSNR)", psnr_str)
         console.print(Panel(tbl, title="[bold]Preview Result[/]", border_style="cyan"))
 
         return Confirm.ask("  Proceed with full encode?", default=True)
-
     except Exception as e:
-        console.print(f"  [yellow]Preview failed ({e}) — continuing[/]")
-        return True
+        console.print(f"  [yellow]Preview error ({e}) — continuing.[/]"); return True
     finally:
         try: shutil.rmtree(tmpdir)
         except: pass
 
 # ════════════════════════════════════════════════════════════════════════
-# OUTPUT COLLISION HANDLING
+# AUDIO EXTRACTION + CONVERSION
 # ════════════════════════════════════════════════════════════════════════
 
-def handle_collision(out_path: str) -> Optional[str]:
-    """
-    Called when output file already exists.
-    Returns new path, or None to skip this file.
-    """
-    console.print(f"\n  [yellow]! File already exists:[/]  [dim]{escape(out_path)}[/]")
-    console.print("  [cyan]1[/]  Overwrite")
-    console.print("  [cyan]2[/]  Auto-rename  (_1, _2, …)")
-    console.print("  [cyan]3[/]  Enter custom name")
-    console.print("  [cyan]4[/]  Skip this file")
+def pick_audio_format() -> Tuple[str, Dict[str, Any]]:
+    """Returns (format_key, format_dict)."""
+    console.print()
+    console.print("[bold cyan]Output Audio Format[/]")
+    tbl = Table(box=box.SIMPLE, padding=(0,1), show_header=False)
+    tbl.add_column("#", style="bold dim", width=3)
+    tbl.add_column("Format")
+    tbl.add_column("Recommended quality", style="dim", width=28)
+    keys = list(AUDIO_FORMATS.keys())
+    guides = {
+        "mp3": "128–320 kb/s",
+        "aac": "96–256 kb/s",
+        "flac":"lossless (no bitrate needed)",
+        "opus":"64–192 kb/s (64 = spoken word, 128 = music)",
+        "wav": "lossless (no bitrate needed)",
+        "ogg": "96–256 kb/s",
+    }
+    for i, k in enumerate(keys, 1):
+        tbl.add_row(str(i), AUDIO_FORMATS[k]["label"], guides.get(k,""))
+    console.print(tbl)
+    c = Prompt.ask("Format", choices=[str(i) for i in range(1, len(keys)+1)], default="1")
+    key = keys[int(c)-1]
+    fmt = deepcopy(AUDIO_FORMATS[key])
 
-    c = Prompt.ask("  Choice", choices=["1","2","3","4"], default="2")
+    if key not in ("flac","wav"):
+        console.print(f"  [dim]Guide: {guides.get(key,'')}[/]")
+        default_br = {"mp3":"192","aac":"192","opus":"128","ogg":"192"}.get(key,"192")
+        fmt["bitrate"] = int(Prompt.ask("Bitrate kb/s", default=default_br))
+    else:
+        fmt["bitrate"] = None
 
-    if c == "1":
-        return out_path
-    if c == "2":
-        stem = Path(out_path).stem
-        ext  = Path(out_path).suffix
-        d    = Path(out_path).parent
-        for i in range(1, 10000):
-            candidate = str(d / f"{stem}_{i}{ext}")
-            if not os.path.exists(candidate):
-                return candidate
-        return str(d / f"{stem}_{int(time.time())}{ext}")
-    if c == "3":
-        raw = Prompt.ask("  New filename (without extension)").strip()
-        if not raw:
-            return None
-        new = str(Path(out_path).parent / f"{raw}.mp4")
-        if os.path.exists(new):
-            console.print(f"  [red]  '{escape(new)}' also exists — using auto-rename[/]")
-            return handle_collision(new)
-        return new
-    return None  # skip
+    return key, fmt
+
+def extract_audio(files: List[str], infos: Dict[str, Optional[dict]],
+                  output_dir: str) -> Tuple[int, int]:
+    """Extract audio from video files. Returns (success, failed)."""
+    _, fmt = pick_audio_format()
+    success, failed = 0, 0
+
+    console.print()
+    console.print(Rule("[bold cyan]Extracting Audio[/]"))
+
+    for i, fpath in enumerate(files, 1):
+        fi = infos.get(fpath) or run_ffprobe(fpath)
+        if not fi:
+            console.print(f"  [{i}/{len(files)}] [red]Cannot read: {escape(Path(fpath).name)}[/]")
+            failed += 1; continue
+
+        as_ = audio_stream(fi)
+        if not as_:
+            console.print(f"  [{i}/{len(files)}] [yellow]No audio track: {escape(Path(fpath).name)}[/]")
+            failed += 1; continue
+
+        out_name = Path(fpath).stem + fmt["ext"]
+        out_path = os.path.join(output_dir, out_name)
+        out_path = _unique_path(out_path)
+
+        console.print(f"\n  [bold][{i}/{len(files)}][/]  {escape(Path(fpath).name)}")
+
+        dur = file_duration(fi)
+        cmd = ["ffmpeg","-hide_banner","-y","-i",fpath,"-vn"]
+
+        co = fmt["codec"]
+        if fmt.get("bitrate"):
+            cmd += ["-c:a", co, "-b:a", f"{fmt['bitrate']}k"]
+        else:
+            cmd += ["-c:a", co]
+        cmd += ["-ar","48000",out_path]
+
+        ok = run_with_progress(cmd, dur, f"Extract [{i}/{len(files)}]")
+        if ok and os.path.exists(out_path):
+            src_sz = file_size_bytes(fi)
+            dst_sz = os.path.getsize(out_path)
+            console.print(f"  [green]OK[/]  {human_size(src_sz)} → [green]{human_size(dst_sz)}[/]  [dim]{escape(out_path)}[/]")
+            success += 1
+        else:
+            failed += 1
+
+    return success, failed
+
+def convert_audio(files: List[str], output_dir: str) -> Tuple[int, int]:
+    """Convert audio files to another format."""
+    _, fmt = pick_audio_format()
+    success, failed = 0, 0
+
+    console.print()
+    console.print(Rule("[bold cyan]Converting Audio[/]"))
+
+    for i, fpath in enumerate(files, 1):
+        fi = run_ffprobe(fpath)
+        if not fi:
+            console.print(f"  [{i}/{len(files)}] [red]Cannot read: {escape(Path(fpath).name)}[/]")
+            failed += 1; continue
+
+        out_name = Path(fpath).stem + fmt["ext"]
+        out_path = os.path.join(output_dir, out_name)
+        out_path = _unique_path(out_path)
+
+        console.print(f"\n  [bold][{i}/{len(files)}][/]  {escape(Path(fpath).name)}")
+        dur = file_duration(fi)
+
+        cmd = ["ffmpeg","-hide_banner","-y","-i",fpath]
+        if fmt.get("bitrate"):
+            cmd += ["-c:a", fmt["codec"], "-b:a", f"{fmt['bitrate']}k"]
+        else:
+            cmd += ["-c:a", fmt["codec"]]
+        cmd += ["-ar","48000", out_path]
+
+        ok = run_with_progress(cmd, dur, f"Convert [{i}/{len(files)}]")
+        if ok and os.path.exists(out_path):
+            src_sz = file_size_bytes(fi)
+            dst_sz = os.path.getsize(out_path)
+            console.print(f"  [green]OK[/]  {human_size(src_sz)} → [green]{human_size(dst_sz)}[/]  [dim]{escape(out_path)}[/]")
+            success += 1
+        else:
+            failed += 1
+
+    return success, failed
 
 # ════════════════════════════════════════════════════════════════════════
 # PRESET IMPORT / EXPORT
@@ -621,73 +772,65 @@ def handle_collision(out_path: str) -> Optional[str]:
 
 def export_preset(preset: dict, name: str) -> None:
     PRESETS_DIR.mkdir(parents=True, exist_ok=True)
-    safe_name = re.sub(r"[^\w\-]", "_", name.strip())
-    path = PRESETS_DIR / f"{safe_name}.json"
-    exportable = {k: v for k, v in preset.items() if not k.startswith("_")}
-    exportable["_fftoolbox_version"] = APP_VERSION
-    exportable["_export_name"]       = name
-    with open(path, "w") as f:
-        json.dump(exportable, f, indent=2)
-    console.print(f"  [green]Preset exported:[/] [dim]{path}[/]")
+    safe = re.sub(r"[^\w\-]","_",name.strip())
+    path = PRESETS_DIR / f"{safe}.json"
+    data = {k: v for k, v in preset.items() if not k.startswith("_")}
+    data["_fftoolbox_version"] = APP_VERSION
+    data["_export_name"]       = name
+    path.write_text(json.dumps(data, indent=2))
+    console.print(f"  [green]Preset saved:[/] [dim]{path}[/]")
 
 def import_preset_menu() -> Optional[Dict[str, Any]]:
     PRESETS_DIR.mkdir(parents=True, exist_ok=True)
     files = sorted(PRESETS_DIR.glob("*.json"))
     if not files:
-        console.print(f"  [dim]No saved presets found in {PRESETS_DIR}[/]")
-        return None
-
+        console.print(f"  [dim]No saved presets in {PRESETS_DIR}[/]"); return None
     console.print("\n[bold cyan]Saved Presets[/]")
     tbl = Table(box=box.SIMPLE, padding=(0,1), show_header=False)
     tbl.add_column("#", style="bold dim", width=3)
-    tbl.add_column("Name")
-    tbl.add_column("Details", style="dim")
+    tbl.add_column("Name"); tbl.add_column("Details", style="dim")
     for i, f in enumerate(files, 1):
         try:
-            with open(f) as fh:
-                d = json.load(fh)
-            detail = f"codec={d.get('codec','?')} crf={d.get('crf','?')} v{d.get('_fftoolbox_version','?')}"
-        except:
-            detail = "?"
+            d = json.loads(f.read_text())
+            detail = f"codec={d.get('codec','?')} crf={d.get('crf','?')}"
+        except: detail = "?"
         tbl.add_row(str(i), d.get("_export_name", f.stem), detail)
     console.print(tbl)
-
-    choices = [str(i) for i in range(1, len(files)+1)]
-    c = Prompt.ask("Load preset #", choices=choices)
+    c = Prompt.ask("Load #", choices=[str(i) for i in range(1,len(files)+1)])
     try:
-        with open(files[int(c)-1]) as fh:
-            loaded = json.load(fh)
-        loaded.setdefault("name",  loaded.get("_export_name","Imported"))
-        loaded.setdefault("emoji", "📥")
-        loaded.setdefault("color", "white")
-        loaded.setdefault("tip",   "Imported preset")
-        loaded.setdefault("group", "Imported")
-        console.print(f"  [green]Loaded preset: {loaded.get('_export_name','?')}[/]")
+        loaded = json.loads(files[int(c)-1].read_text())
+        for key, default in [("name","Imported"),("emoji","📥"),
+                              ("color","white"),("tip","Imported"),("group","Imported")]:
+            loaded.setdefault(key, loaded.get("_export_name", default))
+        console.print(f"  [green]Loaded: {loaded.get('_export_name','?')}[/]")
         return loaded
     except Exception as e:
-        console.print(f"[red]  Failed to load: {e}[/]"); return None
+        console.print(f"[red]  Failed: {e}[/]"); return None
 
 # ════════════════════════════════════════════════════════════════════════
-# AUTO-UPDATER
+# AUTO-UPDATER (background)
 # ════════════════════════════════════════════════════════════════════════
 
-def check_for_update(timeout: float = 2.0) -> None:
-    """Check GitHub for a newer version. Silent if network unavailable."""
+_UPDATE_MSG: Optional[str] = None
+
+def _check_update_bg():
+    global _UPDATE_MSG
     try:
         req = Request(GITHUB_RAW_URL, headers={"User-Agent": f"fftoolbox/{APP_VERSION}"})
-        with urlopen(req, timeout=timeout) as resp:
-            remote = resp.read().decode().strip()
+        with urlopen(req, timeout=2) as r:
+            remote = r.read().decode().strip()
         if remote and remote != APP_VERSION:
-            console.print(
-                Panel(
-                    f"[bold yellow]Update available: v{remote}[/]\n"
-                    f"[dim]You have v{APP_VERSION}. Get the latest at:[/]\n"
-                    "https://github.com/yourusername/fftoolbox",
-                    border_style="yellow", title="[yellow]Update[/]",
-                )
-            )
-    except (URLError, OSError):
-        pass  # no network — silent
+            _UPDATE_MSG = remote
+    except: pass
+
+def show_update_banner():
+    if _UPDATE_MSG:
+        console.print(Panel(
+            f"[bold yellow]Update available: v{_UPDATE_MSG}[/]  (you have v{APP_VERSION})\n"
+            "[dim]https://github.com/yourusername/fftoolbox[/]",
+            border_style="yellow", title="[yellow]Update[/]",
+        ))
+        console.print()
 
 # ════════════════════════════════════════════════════════════════════════
 # UI HELPERS
@@ -697,11 +840,11 @@ def print_banner():
     console.print()
     console.print(Panel.fit(
         Align.center(
-            f"[bold cyan]{APP_NAME}[/][bold white] Pro[/]  [dim]v{APP_VERSION}[/]  [dim]|[/]  "
-            "[italic]Smart Video Converter[/]\n"
-            "[dim]Powered by FFmpeg  ·  Professional Terminal Interface[/]"
+            f"[bold cyan]{APP_NAME}[/][bold white] Pro[/]  [dim]v{APP_VERSION}[/]  [dim]│[/]  "
+            "[italic]Smart Media Converter[/]\n"
+            "[dim]Video · Audio Extraction · Audio Conversion · DaVinci Resolve[/]"
         ),
-        border_style="cyan", padding=(0,6),
+        border_style="cyan", padding=(0,4),
     ))
     console.print()
 
@@ -709,50 +852,67 @@ def print_file_info(info: dict, path: str):
     vs  = video_stream(info)
     dur = file_duration(info)
     sz  = file_size_bytes(info)
-    vc  = (vs or {}).get("codec_name","?").upper()
-    as_ = audio_stream(info)
-    ac  = (as_ or {}).get("codec_name","?").upper()
 
     tbl = Table(box=box.ROUNDED, border_style="dim", show_header=False, padding=(0,1))
-    tbl.add_column("K", style="bold cyan", width=16)
-    tbl.add_column("V", style="white")
-    tbl.add_row("Filename",  escape(Path(path).name))
-    tbl.add_row("Size",      human_size(sz))
-    tbl.add_row("Duration",  human_dur(dur))
+    tbl.add_column("K", style="bold cyan", width=17); tbl.add_column("V")
+    tbl.add_row("File",     escape(Path(path).name))
+    tbl.add_row("Size",     human_size(sz))
+    tbl.add_row("Duration", human_dur(dur))
+
     if vs:
-        w = vs.get("width","?"); h = vs.get("height","?")
-        tbl.add_row("Resolution", f"{w} x {h}")
+        vc = vs.get("codec_name","?").upper()
+        w  = vs.get("width","?"); h = vs.get("height","?")
+        tbl.add_row("Resolution", f"{w} × {h}")
         tbl.add_row("FPS",        fps_str(vs))
         bit = vs.get("bit_rate")
         if bit: tbl.add_row("Video bitrate", f"{int(bit)//1000} kb/s")
-    vc_display = vc
-    if any(p in vc.lower() for p in PROFESSIONAL_CODECS):
-        vc_display = f"[bold yellow]! {vc}  (professional codec — large file)[/]"
-    tbl.add_row("Video codec", vc_display)
-    na = len(all_audio_streams(info))
-    tbl.add_row("Audio codec", f"{ac}" + (f"  ({na} tracks)" if na > 1 else ""))
+        vc_disp = (f"[bold yellow]⚠ {vc} (professional — large file)[/]"
+                   if any(p in vc.lower() for p in PROFESSIONAL_CODECS) else vc)
+        tbl.add_row("Video codec", vc_disp)
+
+    for i, as_ in enumerate(all_audio_streams(info)):
+        ac = as_.get("codec_name","?").upper()
+        sr = as_.get("sample_rate","?")
+        ch = as_.get("channels","?")
+        ab = as_.get("bit_rate")
+        detail = f"{ac}  {sr}Hz  {ch}ch"
+        if ab: detail += f"  {int(ab)//1000}kb/s"
+        tbl.add_row(f"Audio {i+1}" if len(all_audio_streams(info))>1 else "Audio", detail)
+
+    subs = subtitle_streams(info)
+    if subs:
+        tbl.add_row("Subtitles", f"{len(subs)} track(s)")
+
+    # Smart tips
     if sz > 500*1024*1024:
-        tbl.add_row("[yellow]Tip[/]","[yellow]Large file — [bold]DaVinci Resolve Cleanup[/] preset suggested[/]")
-    elif vs and safe_int(vs.get("width")) >= 3840:
-        tbl.add_row("[dim]Tip[/]","[dim]4K source · [bold]Archive H.265[/] or [bold]Smart[/] preset saves most space[/]")
-    console.print(Panel(tbl, title="[bold]Source File[/]", border_style="cyan", padding=(0,1)))
+        tbl.add_row("[yellow]Tip[/]","[yellow]Large file — [bold]Resolve Cleanup[/] or [bold]Smart[/] suggested[/]")
+    if vs and safe_int(vs.get("width")) >= 3840:
+        tbl.add_row("[dim]Tip[/]","[dim]4K source detected[/]")
+    if is_audio_only(info):
+        tbl.add_row("[cyan]Type[/]","[cyan]Audio-only file[/]")
+
+    title = "[bold]Source File[/]" if not is_audio_only(info) else "[bold]Source Audio[/]"
+    console.print(Panel(tbl, title=title, border_style="cyan", padding=(0,1)))
 
 def show_presets_table(suggested_key: Optional[str] = None):
     tbl = Table(box=box.SIMPLE_HEAD, border_style="dim", padding=(0,1))
     tbl.add_column("#",      style="bold dim", width=3)
-    tbl.add_column("Preset", width=42)
+    tbl.add_column("Preset", width=44)
     tbl.add_column("Description")
     last_group = None
     for i, (key, p) in enumerate(PRESETS.items(), 1):
-        if p.get("group") != last_group:
-            tbl.add_row("","[bold dim]" + p.get("group","") + "[/]","")
-            last_group = p.get("group")
-        m = "  [bold cyan]<-- suggested[/]" if key == suggested_key else ""
-        tbl.add_row(str(i), f"[{p['color']}]{p['emoji']}  {p['name']}[/]{m}", f"[dim]{p['desc']}[/]")
-    tbl.add_row("i","[dim]Import saved preset[/]","")
-    console.print(Panel(tbl, title="[bold]Presets[/]", border_style="cyan"))
+        g = p.get("group","")
+        if g != last_group:
+            tbl.add_row("", f"[bold dim]{g}[/]", ""); last_group = g
+        m = "  [bold cyan]← suggested[/]" if key == suggested_key else ""
+        tbl.add_row(str(i),
+                    f"[{p['color']}]{p['emoji']}  {p['name']}[/]{m}",
+                    f"[dim]{p['desc']}[/]")
+    tbl.add_row("i", "[dim]Import saved preset[/]", "")
+    console.print(Panel(tbl, title="[bold]Video Presets[/]", border_style="cyan"))
 
 def suggest_preset(info: dict) -> str:
+    if is_audio_only(info): return "fix_audio"
     sz = file_size_bytes(info)
     vs = video_stream(info)
     w  = safe_int((vs or {}).get("width"))
@@ -760,148 +920,227 @@ def suggest_preset(info: dict) -> str:
     if w >= 3840: return "smart"
     return "web_1080p"
 
+def _unique_path(path: str) -> str:
+    """Return path unchanged if it doesn't exist, else append _1, _2, ..."""
+    if not os.path.exists(path): return path
+    p   = Path(path)
+    for i in range(1, 10000):
+        candidate = str(p.parent / f"{p.stem}_{i}{p.suffix}")
+        if not os.path.exists(candidate): return candidate
+    return str(p.parent / f"{p.stem}_{int(time.time())}{p.suffix}")
+
 # ════════════════════════════════════════════════════════════════════════
-# FILE BROWSER — supports both number input AND direct path typing
+# COLLISION HANDLER
 # ════════════════════════════════════════════════════════════════════════
 
-def file_browser(start: str = "~") -> Optional[List[str]]:
+def handle_collision(out_path: str) -> Optional[str]:
+    console.print(f"\n  [yellow]⚠  Already exists:[/] [dim]{escape(Path(out_path).name)}[/]")
+    console.print("  [cyan]1[/]  Overwrite")
+    console.print("  [cyan]2[/]  Auto-rename  (_1, _2, …)")
+    console.print("  [cyan]3[/]  Enter new name")
+    console.print("  [cyan]4[/]  Skip this file")
+    c = Prompt.ask("  Choice", choices=["1","2","3","4"], default="2")
+    if c == "1": return out_path
+    if c == "2": return _unique_path(out_path)
+    if c == "3":
+        raw = Prompt.ask("  New filename (no extension)").strip()
+        if not raw: return None
+        new = str(Path(out_path).parent / f"{raw}.mp4")
+        if os.path.exists(new): return _unique_path(new)
+        return new
+    return None  # skip
+
+# ════════════════════════════════════════════════════════════════════════
+# FILE BROWSER  (numbers + direct paths + search + recent)
+# ════════════════════════════════════════════════════════════════════════
+
+def file_browser(start: str = "~", history: Optional[Dict] = None,
+                 audio_mode: bool = False) -> Optional[List[str]]:
+    """
+    Interactive file browser.
+    - Numbers to navigate
+    - Paste full/partial path directly
+    - Partial name search
+    - 'r' = recent files/dirs
+    - 'a' = select all media in current dir
+    - 'R' = recursive
+    """
+    extensions = ALL_MEDIA if audio_mode else VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
     current = Path(os.path.expanduser(start)).resolve()
 
+    # If start dir already has videos, we stay there
     while True:
         console.print()
-        console.print(Rule(f"[bold cyan]File Browser[/]  [dim]{escape(str(current))}[/]"))
+        console.print(Rule(f"[bold cyan]📁  Browser[/]  [dim]{escape(str(current))}[/]"))
+
         try:
             raw = sorted(current.iterdir(), key=lambda p:(p.is_file(), p.name.lower()))
         except PermissionError:
-            console.print("[red]  Permission denied — going up[/]")
-            current = current.parent; continue
+            console.print("[red]  Permission denied[/]"); current = current.parent; continue
 
         dirs   = [e for e in raw if e.is_dir()  and not e.name.startswith(".")]
-        videos = [e for e in raw if e.is_file() and e.suffix.lower() in VIDEO_EXTENSIONS]
-        items: List[Tuple[Path,bool]] = []
+        media  = [e for e in raw if e.is_file() and e.suffix.lower() in extensions]
+        items: List[Tuple[Path, bool]] = []
 
         tbl = Table(box=box.SIMPLE, show_header=True, padding=(0,1))
         tbl.add_column("#",    style="bold dim", width=4)
         tbl.add_column("Name", width=46)
         tbl.add_column("Size", style="dim", width=10)
-        tbl.add_column("Type", style="dim", width=10)
+        tbl.add_column("Info", style="dim", width=12)
 
-        tbl.add_row("0","[bold]..  (go up)[/]","","")
+        tbl.add_row("0","[bold]↑  .. (go up)[/]","","")
         items.append((current.parent, True))
+
         for d in dirs[:40]:
             n = len(items)
             try:
-                cnt = sum(1 for x in d.iterdir() if x.is_file() and x.suffix.lower() in VIDEO_EXTENSIONS)
-                info_s = f"{cnt} video{'s' if cnt!=1 else ''}" if cnt else ""
+                cnt = sum(1 for x in d.iterdir()
+                          if x.is_file() and x.suffix.lower() in extensions)
+                info_s = f"{cnt} file{'s' if cnt!=1 else ''}" if cnt else ""
             except: info_s = ""
-            tbl.add_row(str(n), f"[yellow]D  {escape(d.name)}[/]", "", info_s)
+            tbl.add_row(str(n), f"[yellow]📁  {escape(d.name)}[/]", "", info_s)
             items.append((d, True))
-        if not videos:
-            tbl.add_row("","[dim]  -- no video files here --[/]","","")
-        for v in videos:
+
+        if not media:
+            tbl.add_row("", "[dim]  — no media files here —[/]","","")
+        for f in media:
             n = len(items)
-            tbl.add_row(str(n), f"[green]V  {escape(v.name)}[/]", human_size(v.stat().st_size), v.suffix.upper().lstrip("."))
-            items.append((v, False))
+            ext_tag = f.suffix.upper().lstrip(".")
+            color = "green" if f.suffix.lower() in VIDEO_EXTENSIONS else "bright_blue"
+            tbl.add_row(str(n), f"[{color}]{'🎬' if f.suffix.lower() in VIDEO_EXTENSIONS else '🎵'}  {escape(f.name)}[/]",
+                        human_size(f.stat().st_size), ext_tag)
+            items.append((f, False))
 
         console.print(tbl)
         console.print()
-        console.print("[dim]  #: select  |  /path or ~/path: jump to dir/file  |  a: all videos  |  r: recursive  |  q: cancel[/]")
 
-        raw_input = Prompt.ask("[bold cyan]  >[/]").strip()
-        choice    = raw_input.lower()
+        hints = ["[bold]#[/] navigate/select",
+                 "[bold]a[/] all here",
+                 "[bold]R[/] recursive",
+                 "[bold]r[/] recent",
+                 "[bold]/path[/] jump",
+                 "[bold]q[/] cancel"]
+        console.print("  [dim]" + "  ·  ".join(hints) + "[/]")
 
-        if choice == "q": return None
+        raw_in = Prompt.ask("[bold cyan]  >[/]").strip()
+        low    = raw_in.lower()
 
-        # ── Direct path input ──────────────────────────────────────────
-        # Detect if input looks like a path (starts with / ~ . or contains /)
-        if (raw_input.startswith(("/","~","./","../")) or
-            (os.sep in raw_input) or
-            (len(raw_input) > 2 and raw_input[1] == ":")):  # Windows C:\
-            expanded = Path(os.path.expanduser(raw_input)).resolve()
-            if expanded.is_dir():
-                current = expanded; continue
-            elif expanded.is_file():
-                if expanded.suffix.lower() in VIDEO_EXTENSIONS:
-                    return [str(expanded)]
-                else:
-                    console.print(f"  [yellow]Not a recognized video file: {expanded.suffix}[/]")
-                    continue
-            else:
-                # Try as search/partial path
-                console.print(f"  [red]Path not found: {expanded}[/]")
-                continue
+        if low == "q": return None
 
-        # ── Commands ───────────────────────────────────────────────────
-        if choice == "a":
-            if videos:
-                console.print(f"[green]  {len(videos)} file(s) selected[/]")
-                return [str(v) for v in videos]
-            console.print("[yellow]  No video files here.[/]"); continue
-
-        if choice == "r":
-            vids = [str(f) for f in sorted(current.rglob("*"))
-                    if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS]
-            if vids:
-                console.print(f"[green]  {len(vids)} file(s) found recursively[/]")
-                return vids
-            console.print("[yellow]  No video files found recursively.[/]"); continue
-
-        # ── Number input ───────────────────────────────────────────────
-        try: idx = int(raw_input)
-        except ValueError:
-            # Partial name search
-            matches = [v for v in videos if raw_input.lower() in v.name.lower()]
-            if len(matches) == 1:
-                return [str(matches[0])]
-            elif len(matches) > 1:
-                console.print(f"  [yellow]{len(matches)} matches — be more specific or use number[/]")
-                for m in matches[:5]: console.print(f"  [dim]{m.name}[/]")
-            else:
-                console.print(f"  [red]No match for '{escape(raw_input)}'[/]")
+        # ── Recent files/dirs ──────────────────────────────────────────
+        if low == "r":
+            h = history or {}
+            rec_dirs  = h.get("recent_dirs",  [])[:8]
+            rec_files = h.get("recent_files", [])[:8]
+            if not rec_dirs and not rec_files:
+                console.print("  [dim]No recent history.[/]"); continue
+            tbl2 = Table(box=box.SIMPLE, padding=(0,1), show_header=False)
+            tbl2.add_column("#",style="bold dim",width=3); tbl2.add_column("Path"); tbl2.add_column("Type",style="dim")
+            recent_items: List[Tuple[str,bool]] = []
+            for d in rec_dirs:
+                n = len(recent_items)+1
+                if Path(d).exists():
+                    tbl2.add_row(str(n), f"[yellow]{escape(d)}[/]", "dir")
+                    recent_items.append((d, True))
+            for f in rec_files:
+                n = len(recent_items)+1
+                if Path(f).exists():
+                    tbl2.add_row(str(n), f"[green]{escape(f)}[/]", "file")
+                    recent_items.append((f, False))
+            if not recent_items:
+                console.print("  [dim]No existing recent paths.[/]"); continue
+            console.print(tbl2)
+            rc = Prompt.ask("  #", choices=[str(i) for i in range(1,len(recent_items)+1)])
+            rpath, ris_dir = recent_items[int(rc)-1]
+            if ris_dir: current = Path(rpath).resolve()
+            else: return [rpath]
             continue
 
+        # ── All files in dir ───────────────────────────────────────────
+        if low == "a":
+            if media:
+                console.print(f"[green]  ✓  {len(media)} file(s) selected[/]")
+                return [str(f) for f in media]
+            console.print("[yellow]  No media files here.[/]"); continue
+
+        # ── Recursive ─────────────────────────────────────────────────
+        if raw_in.upper() == "R":
+            found = [str(f) for f in sorted(current.rglob("*"))
+                     if f.is_file() and f.suffix.lower() in extensions]
+            if found:
+                console.print(f"[green]  ✓  {len(found)} file(s) found recursively[/]")
+                return found
+            console.print("[yellow]  Nothing found recursively.[/]"); continue
+
+        # ── Direct path input ──────────────────────────────────────────
+        if (raw_in.startswith(("/","~","./","../")) or
+                (os.sep in raw_in and len(raw_in) > 2)):
+            exp = Path(os.path.expanduser(raw_in)).resolve()
+            if exp.is_dir():   current = exp; continue
+            if exp.is_file():  return [str(exp)]
+            # try glob
+            matches = list(Path(exp.parent).glob(exp.name)) if exp.parent.exists() else []
+            if matches:
+                vid = [str(m) for m in matches if m.suffix.lower() in extensions]
+                if vid: return sorted(vid)
+            console.print(f"  [red]Not found: {escape(raw_in)}[/]"); continue
+
+        # ── Partial name search ────────────────────────────────────────
+        if raw_in and not raw_in.isdigit():
+            matches = [f for f in media if raw_in.lower() in f.name.lower()]
+            if len(matches) == 1: return [str(matches[0])]
+            if matches:
+                console.print(f"  [yellow]{len(matches)} matches:[/]")
+                for m in matches[:6]: console.print(f"  [dim]{m.name}[/]")
+            else:
+                console.print(f"  [red]No match for '{escape(raw_in)}'[/]")
+            continue
+
+        # ── Number ────────────────────────────────────────────────────
+        try: idx = int(raw_in)
+        except: console.print("[red]  Enter a number or command.[/]"); continue
         if idx < 0 or idx >= len(items):
-            console.print(f"[red]  Out of range (0-{len(items)-1}).[/]"); continue
+            console.print(f"[red]  Out of range (0–{len(items)-1}).[/]"); continue
         path, is_dir = items[idx]
         if is_dir: current = path.resolve()
-        else: return [str(path)]
+        else:      return [str(path)]
 
 # ════════════════════════════════════════════════════════════════════════
 # RESOLUTION PICKER
 # ════════════════════════════════════════════════════════════════════════
 
-def pick_resolution(src_w=None, src_h=None, recommended=None, default_res=None) -> Optional[Tuple[int,int]]:
+def pick_resolution(src_w=None, src_h=None,
+                    recommended=None, default_res=None) -> Optional[Tuple[int,int]]:
     console.print()
-    console.print("[bold cyan]Resolution  (downscale only — never upscales)[/]")
+    console.print("[bold cyan]Output Resolution  (never upscales)[/]")
     tbl = Table(box=box.SIMPLE, padding=(0,1), show_header=False)
     tbl.add_column("#", style="bold dim", width=4)
     tbl.add_column("Resolution")
     tbl.add_column("Note", style="dim")
     for i,(w,h,label) in enumerate(RESOLUTIONS):
         notes = []
-        if default_res and (w,h) == default_res:           notes.append("[dim]preset default[/]")
-        if recommended  and (w,h) == recommended:          notes.append("[bold cyan]<-- recommended for this target[/]")
-        if w and src_w and src_h and (w > src_w or h > src_h): notes.append("(larger than source)")
-        tbl.add_row(str(i), label, "  ".join(notes) if notes else "")
-    tbl.add_row(str(len(RESOLUTIONS)), "Custom (enter width x height)", "")
+        if default_res   and (w,h)==default_res:   notes.append("preset default")
+        if recommended   and (w,h)==recommended:   notes.append("[bold cyan]← recommended[/]")
+        if w and src_w and src_h and (w>src_w or h>src_h): notes.append("(larger than source)")
+        tbl.add_row(str(i), label, "  ".join(notes))
+    tbl.add_row(str(len(RESOLUTIONS)), "Custom (enter W × H)", "")
     console.print(tbl)
-
-    default_idx = 0
+    di = 0
     if recommended:
         for i,(w,h,_) in enumerate(RESOLUTIONS):
-            if (w,h) == recommended: default_idx = i; break
+            if (w,h)==recommended: di=i; break
     elif default_res:
         for i,(w,h,_) in enumerate(RESOLUTIONS):
-            if (w,h) == default_res: default_idx = i; break
-
-    choices = [str(i) for i in range(len(RESOLUTIONS)+1)]
-    c = Prompt.ask("Choice", choices=choices, default=str(default_idx))
+            if (w,h)==default_res: di=i; break
+    c = Prompt.ask("Choice",
+                   choices=[str(i) for i in range(len(RESOLUTIONS)+1)],
+                   default=str(di))
     idx = int(c)
     if idx == 0: return None
     if idx < len(RESOLUTIONS):
         w,h,_ = RESOLUTIONS[idx]; return (w,h) if w else None
     w = int(Prompt.ask("  Width (px)")); h = int(Prompt.ask("  Height (px)"))
-    return ((w//2)*2, (h//2)*2)
+    return ((w//2)*2,(h//2)*2)
 
 # ════════════════════════════════════════════════════════════════════════
 # CUSTOM PRESET BUILDER
@@ -914,48 +1153,47 @@ def build_custom_preset(info: Optional[dict]) -> dict:
         "max_res":None,"target_mb":None,"two_pass":False,
     }
     console.print()
-    console.print(Rule("[bold]Custom Configuration[/]"))
+    console.print(Rule("[bold]⚙️  Custom Configuration[/]"))
 
     # Codec
     console.print("\n[bold cyan]Video Codec[/]")
     codec_opts = [
         ("libx264","H.264 — widest compatibility"),
         ("libx265","H.265 — ~40% smaller, modern devices"),
-        ("copy","Copy video stream (instant, recode audio only)"),
-        ("libaom-av1","AV1 — next-gen, very slow"),
+        ("copy",   "Copy video unchanged  (recode audio only, instant)"),
+        ("libaom-av1","AV1 — next-gen, very slow encode"),
         ("libvpx-vp9","VP9 — open source, good quality"),
     ]
     hw = detect_hw_encoders()
     all_codecs = codec_opts + [(e,f"[HW] {l}") for e,l in hw]
     tbl = Table(box=box.SIMPLE,padding=(0,1),show_header=False)
-    tbl.add_column("#",style="bold dim",width=3); tbl.add_column("Codec")
+    tbl.add_column("#",style="bold dim",width=3); tbl.add_column("Option")
     for i,(e,l) in enumerate(all_codecs,1): tbl.add_row(str(i),l)
     console.print(tbl)
-    c = Prompt.ask("Codec", choices=[str(i) for i in range(1,len(all_codecs)+1)], default="1")
+    c = Prompt.ask("Codec",choices=[str(i) for i in range(1,len(all_codecs)+1)],default="1")
     preset["codec"] = all_codecs[int(c)-1][0]
 
     if preset["codec"] != "copy":
         # Quality
-        console.print("\n[bold cyan]Quality Mode[/]")
-        console.print("  [cyan]1[/]  CRF  (constant quality, recommended)")
-        console.print("  [cyan]2[/]  Target file size MB  (two-pass, precise)")
-        console.print("  [cyan]3[/]  Target % of original  (two-pass)")
+        console.print("\n[bold cyan]Quality / Size Control[/]")
+        console.print("  [cyan]1[/]  CRF  (constant quality — recommended)")
+        console.print("  [cyan]2[/]  Target file size in MB  (two-pass)")
+        console.print("  [cyan]3[/]  Target % of original size  (two-pass)")
         qm = Prompt.ask("Mode", choices=["1","2","3"], default="1")
         if qm == "1":
-            console.print("  [dim]0=lossless · 15=excellent · 18=high · 23=default · 28=compact · 33=tiny · 51=worst[/]")
+            console.print("  [dim]0=lossless · 15=excellent · 18=high · 23=default · 28=compact · 33=tiny[/]")
             preset["crf"] = int(Prompt.ask("CRF", default="23"))
         elif qm == "2":
-            preset["target_mb"] = float(Prompt.ask("Target MB", default="100"))
-            preset["two_pass"]  = True
-            console.print(f"  [dim]Actual target = {preset['target_mb']*BITRATE_SAFETY:.0f} MB (96% safety margin = always under)[/]")
+            tgt = float(Prompt.ask("Target MB", default="100"))
+            preset["target_mb"] = tgt; preset["two_pass"] = True
+            console.print(f"  [dim]Safety margin ({BITRATE_SAFETY*100:.0f}%): actual target ≈ {tgt*BITRATE_SAFETY:.0f} MB[/]")
         else:
-            pct = float(Prompt.ask("Keep what % of original (e.g. 30)", default="30"))
-            preset["_pct"]     = pct/100.0
-            preset["two_pass"] = True
+            pct = float(Prompt.ask("Keep what % (e.g. 30)", default="30"))
+            preset["_pct"] = pct/100.0; preset["two_pass"] = True
 
         # Speed
-        hw_names = {"nvenc","vaapi","qsv","videotoolbox","amf"}
-        if not any(h in preset["codec"] for h in hw_names):
+        HW = {"nvenc","vaapi","qsv","videotoolbox","amf"}
+        if not any(h in preset["codec"] for h in HW):
             console.print("\n[bold cyan]Encode Speed[/]")
             speed_map = {"1":"ultrafast","2":"superfast","3":"veryfast","4":"faster",
                          "5":"fast","6":"medium","7":"slow","8":"slower","9":"veryslow"}
@@ -963,123 +1201,157 @@ def build_custom_preset(info: Optional[dict]) -> dict:
             sp = Prompt.ask("Speed", choices=list(speed_map.keys()), default="7")
             preset["speed"] = speed_map[sp]
 
-        # Resolution with recommendation
-        vs    = video_stream(info) if info else None
+        # Resolution
+        vs   = video_stream(info) if info else None
         src_w = safe_int((vs or {}).get("width"))  if vs else None
         src_h = safe_int((vs or {}).get("height")) if vs else None
         rec   = None
         if preset.get("target_mb") and src_w and src_h:
             dur = file_duration(info) if info else 0
-            rec, expl = recommend_resolution_for_target(
-                preset["target_mb"], dur, preset.get("audio_kbps",128), src_w, src_h)
-            console.print(f"\n  [dim]Smart recommendation: {expl}[/]")
+            rec, expl = recommend_resolution(preset["target_mb"],dur,
+                                             preset.get("audio_kbps",128),src_w,src_h)
+            console.print(f"\n  [dim]Recommendation: {expl}[/]")
         preset["max_res"] = pick_resolution(src_w, src_h, recommended=rec)
 
-        # Filters
-        console.print("\n[bold cyan]Optional Filters[/]")
-        if Confirm.ask("  Deinterlace (interlaced source)?", default=False):
+        # Extra options
+        console.print("\n[bold cyan]Extra Options[/]")
+        if Confirm.ask("  Deinterlace (interlaced/TV source)?", default=False):
             preset["_deinterlace"] = True
         if Confirm.ask("  Noise reduction (hqdn3d)?", default=False):
             preset["_denoise"] = True
+        if info and subtitle_streams(info):
+            if Confirm.ask(f"  Copy subtitle tracks ({len(subtitle_streams(info))} found)?", default=True):
+                preset["_copy_subs"] = True
         if not preset.get("two_pass"):
-            if Confirm.ask("  Force two-pass (better bitrate accuracy)?", default=False):
+            if Confirm.ask("  Force two-pass encoding?", default=False):
                 preset["two_pass"] = True
+        if Confirm.ask("  Preserve metadata (title, artist, etc.)?", default=True):
+            preset["_copy_meta"] = True
 
     # Audio
-    console.print("\n[bold cyan]Audio Codec[/]")
+    console.print("\n[bold cyan]Audio[/]")
     audio_opts = [
-        ("aac","AAC — best compatibility"),("libopus","Opus — efficient, modern"),
-        ("libmp3lame","MP3 — universal"),("eac3","E-AC3 (Dolby Digital Plus)"),
-        ("flac","FLAC — lossless"),("copy","Copy audio unchanged"),
+        ("aac",      "AAC — best compatibility (recommended)"),
+        ("pcm_s16le","PCM 16-bit — lossless · DaVinci Resolve compatible"),
+        ("pcm_s24le","PCM 24-bit — lossless · studio quality"),
+        ("libopus",  "Opus — efficient, modern"),
+        ("libmp3lame","MP3 — universal"),
+        ("flac",     "FLAC — lossless compressed"),
+        ("copy",     "Copy audio unchanged"),
+        ("__none__", "Remove all audio (silent video)"),
     ]
     tbl2 = Table(box=box.SIMPLE,padding=(0,1),show_header=False)
-    tbl2.add_column("#",style="bold dim",width=3); tbl2.add_column("Codec")
+    tbl2.add_column("#",style="bold dim",width=3); tbl2.add_column("Option")
     for i,(e,l) in enumerate(audio_opts,1): tbl2.add_row(str(i),l)
     console.print(tbl2)
     ac = Prompt.ask("Audio", choices=[str(i) for i in range(1,len(audio_opts)+1)], default="1")
     preset["audio_codec"] = audio_opts[int(ac)-1][0]
-    if preset["audio_codec"] not in ("copy","flac"):
-        preset["audio_kbps"] = int(Prompt.ask("Audio bitrate kb/s", default="128"))
+    if preset["audio_codec"] == "__none__":
+        preset["audio_codec"] = None; preset["_no_audio"] = True
+    elif preset["audio_codec"] not in ("copy","flac","pcm_s16le","pcm_s24le"):
+        preset["audio_kbps"] = int(Prompt.ask("Audio kb/s", default="192"))
 
     if info and len(all_audio_streams(info)) > 1:
-        console.print(f"\n  [yellow]! {len(all_audio_streams(info))} audio tracks detected.[/]")
-        if Confirm.ask("  Include all audio tracks?", default=True):
+        console.print(f"\n  [yellow]⚠  {len(all_audio_streams(info))} audio tracks found.[/]")
+        if Confirm.ask("  Include ALL audio tracks?", default=True):
             preset["_all_audio"] = True
 
-    # Export option
+    # Save option
     if Confirm.ask("\n  Save this preset for future use?", default=False):
-        name = Prompt.ask("  Preset name").strip()
-        if name: export_preset(preset, name)
+        n = Prompt.ask("  Preset name").strip()
+        if n: export_preset(preset, n)
 
     return preset
 
 # ════════════════════════════════════════════════════════════════════════
-# CONFIGURE PRESET
+# CONFIGURE PRESET (interactive per-preset questions)
 # ════════════════════════════════════════════════════════════════════════
 
 def configure_preset(key: str, preset: dict, info: Optional[dict]) -> dict:
-    preset = dict(preset)
+    preset = deepcopy(preset)
 
     if key == "smart":
         if info:
             console.print("\n  [dim]Analyzing video …[/]")
             preset = compute_smart_preset(info)
         else:
-            console.print("  [yellow]Cannot analyze — no file info. Using defaults.[/]")
-            preset["crf"]   = 23
-            preset["speed"] = "slow"
+            preset["crf"] = 23; preset["speed"] = "slow"
+
+    elif key == "resolve_audio_fix":
+        vs = video_stream(info) if info else None
+        if vs:
+            vc = vs.get("codec_name","?")
+            console.print(f"\n  [dim]Video codec: {vc.upper()} → will be copied unchanged[/]")
+        console.print(
+            "\n  [dim]DaVinci Resolve on Linux often rejects AAC, Opus, and MP3 audio.\n"
+            "  This preset converts audio to [bold]PCM 16-bit 48 kHz[/] in a .mov container\n"
+            "  — the format Resolve handles most reliably.[/]"
+        )
+        bit_depth = Prompt.ask("  PCM bit depth", choices=["16","24","32"], default="16")
+        preset["audio_codec"] = f"pcm_s{bit_depth}le"
+
+    elif key == "resolve_import_ready":
+        console.print(
+            "\n  [dim]This encodes video to H.264 and audio to PCM in a .mov container.\n"
+            "  Use this to make any video ready for DaVinci Resolve on Linux.[/]"
+        )
+        if info:
+            vs  = video_stream(info)
+            src_w = safe_int((vs or {}).get("width")) if vs else None
+            src_h = safe_int((vs or {}).get("height")) if vs else None
+            if Confirm.ask("  Change resolution?", default=False):
+                preset["max_res"] = pick_resolution(src_w, src_h)
 
     elif key == "target_mb":
         console.print()
         console.print(Panel(
-            "[dim]Two-pass encoding with 96% safety margin — output always stays UNDER your target.\n"
-            "WhatsApp video (with preview): [bold]100 MB[/]  |  Telegram: [bold]2 GB[/]\n"
-            "Guide: 50 MB ~ 3-5 min 720p  |  100 MB ~ 5-10 min 720p[/]",
-            border_style="dim",title="[dim]Info[/]",
+            f"[dim]Two-pass with [bold]{BITRATE_SAFETY*100:.0f}%[/] safety margin.\n"
+            "Output is always UNDER your target (rare edge-cases auto-retry at 90%).\n"
+            "WhatsApp: [bold]100 MB[/]  ·  Telegram: [bold]2 GB[/]  ·  Email: [bold]25 MB[/][/]",
+            border_style="dim",title="[dim]Target Size Info[/]",
         ))
-        target = float(Prompt.ask("Target file size (MB)", default="100"))
-        preset["target_mb"] = target
-        actual = target * BITRATE_SAFETY
-        console.print(f"  [dim]Actual bitrate target: {actual:.0f} MB ({BITRATE_SAFETY*100:.0f}% safety margin)[/]")
-        # Smart resolution recommendation
+        tgt = float(Prompt.ask("Target MB", default="100"))
+        preset["target_mb"] = tgt
+        console.print(f"  [dim]Internal target: {tgt*BITRATE_SAFETY:.1f} MB ({BITRATE_SAFETY*100:.0f}% safety)[/]")
         vs    = video_stream(info) if info else None
         src_w = safe_int((vs or {}).get("width",1920))  if vs else 1920
         src_h = safe_int((vs or {}).get("height",1080)) if vs else 1080
         dur   = file_duration(info) if info else 0
-        rec, expl = recommend_resolution_for_target(target, dur, preset.get("audio_kbps",128), src_w, src_h)
-        console.print(f"  [dim]Smart recommendation: {expl}[/]")
+        rec, expl = recommend_resolution(tgt, dur, preset.get("audio_kbps",128), src_w, src_h)
+        console.print(f"  [dim]{expl}[/]")
         preset["max_res"] = pick_resolution(src_w, src_h, recommended=rec)
 
     elif key == "target_percent":
         sz = file_size_bytes(info) if info else 0
         console.print()
         if sz > 0:
-            console.print(f"  Source: [bold]{sz/1024/1024:.1f} MB[/]")
-            console.print("  [dim]10 = tiny  |  30 = aggressively smaller  |  50 = half  |  80 = subtle[/]")
-        pct = float(Prompt.ask("Keep what % of original size?", default="30"))
+            console.print(f"  [dim]Source: {sz/1024/1024:.1f} MB[/]")
+            console.print("  [dim]10 = tiny  ·  30 = aggressively smaller  ·  50 = half  ·  80 = subtle[/]")
+        pct = float(Prompt.ask("Keep what % of original?", default="30"))
         preset["_pct"] = pct/100.0
-        vs    = video_stream(info) if info else None
-        src_w = safe_int((vs or {}).get("width",1920))  if vs else 1920
-        src_h = safe_int((vs or {}).get("height",1080)) if vs else 1080
         if sz > 0:
-            est_target = sz/1024/1024 * pct/100.0
-            dur = file_duration(info) if info else 0
-            rec, expl = recommend_resolution_for_target(est_target, dur, preset.get("audio_kbps",128), src_w, src_h)
-            console.print(f"  [dim]Smart recommendation: {expl}[/]")
+            est_tgt = sz/1024/1024 * pct/100.0
+            vs    = video_stream(info) if info else None
+            src_w = safe_int((vs or {}).get("width",1920))  if vs else 1920
+            src_h = safe_int((vs or {}).get("height",1080)) if vs else 1080
+            dur   = file_duration(info) if info else 0
+            rec, expl = recommend_resolution(est_tgt, dur, preset.get("audio_kbps",128), src_w, src_h)
+            console.print(f"  [dim]{expl}[/]")
             preset["max_res"] = pick_resolution(src_w, src_h, recommended=rec)
 
     elif key == "whatsapp":
-        console.print()
-        console.print("  [dim]WhatsApp video (with preview) limit: [bold]100 MB[/], [bold]720p[/] max.\n"
-                      "  As [bold]document[/]: up to 2 GB, no preview.[/]")
-        as_doc = Confirm.ask("  Send as document (up to 2 GB, no preview)?", default=False)
+        console.print(
+            "\n  [dim]WhatsApp video (with preview): [bold]100 MB[/] · 720p\n"
+            "  As document (no preview): up to [bold]2 GB[/][/]"
+        )
+        as_doc = Confirm.ask("  Send as document?", default=False)
         if as_doc:
             preset["target_mb"] = None; preset["max_res"] = None
             preset["crf"] = 20; preset["two_pass"] = False
         else:
-            target = float(Prompt.ask("  Target MB (default 95)", default="95"))
-            preset["target_mb"] = target
-            console.print(f"  [dim]Safety margin applied: actual target ~{target*BITRATE_SAFETY:.0f} MB[/]")
+            tgt = float(Prompt.ask("  Target MB", default="95"))
+            preset["target_mb"] = tgt
+            console.print(f"  [dim]Safety margin: internal target {tgt*BITRATE_SAFETY:.0f} MB[/]")
 
     elif key in ("compress_light","compress_medium","compress_heavy"):
         console.print()
@@ -1096,37 +1368,74 @@ def configure_preset(key: str, preset: dict, info: Optional[dict]) -> dict:
 # ════════════════════════════════════════════════════════════════════════
 
 def build_vf_list(preset: dict, src_w, src_h) -> List[str]:
-    filters = []
-    if preset.get("_deinterlace"): filters.append("yadif=mode=1")
-    if preset.get("_denoise"):     filters.append("hqdn3d=4:3:6:4.5")
-    max_res = preset.get("max_res")
-    if max_res and src_w and src_h:
-        sf = scale_vf(src_w, src_h, max_res)
-        if sf: filters.append(sf)
-    # Always ensure even dimensions
-    if not any("scale=" in f for f in filters):
-        filters.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
-    return filters
+    f = []
+    if preset.get("_deinterlace"): f.append("yadif=mode=1")
+    if preset.get("_denoise"):     f.append("hqdn3d=4:3:6:4.5")
+    mr = preset.get("max_res")
+    if mr and src_w and src_h:
+        sf = scale_vf(src_w, src_h, mr)
+        if sf: f.append(sf)
+    if not any("scale=" in x for x in f):
+        f.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
+    return f
 
-def build_cmd(input_path, output_path, preset, src_w, src_h,
-              video_kbps=None, pass_num=0, passlog=None) -> List[str]:
+def build_cmd(input_path: str, output_path: str, preset: dict,
+              src_w, src_h, video_kbps=None,
+              pass_num: int = 0, passlog: Optional[str] = None) -> List[str]:
+
+    out_ext = preset.get("_output_ext", ".mp4")
+    # Override extension in output_path if needed
+    if not output_path.endswith(out_ext):
+        output_path = str(Path(output_path).with_suffix(out_ext))
+
     cmd = ["ffmpeg","-hide_banner","-y","-i",input_path]
     co  = preset.get("codec") or "libx264"
+    HW  = {"nvenc","vaapi","qsv","videotoolbox","amf"}
 
+    # Metadata preservation
+    if preset.get("_copy_meta"): cmd += ["-map_metadata","0"]
+
+    # ── Copy-video path ────────────────────────────────────────────────
     if co == "copy":
-        ac = preset.get("audio_codec") or "aac"
-        ab = preset.get("audio_kbps") or 192
-        am = ["-map","0:v","-map","0:a"] if preset.get("_all_audio") else ["-map","0:v","-map","0:a?"]
-        cmd += am + ["-c:v","copy"]
-        cmd += ["-c:a","copy"] if ac=="copy" else ["-c:a",ac,"-b:a",f"{ab}k"]
-        cmd += ["-movflags","+faststart",output_path]
-        return cmd
+        if preset.get("_no_audio"):
+            cmd += ["-map","0:v","-c:v","copy","-an"]
+        elif preset.get("_all_audio"):
+            cmd += ["-map","0:v","-map","0:a","-c:v","copy"]
+        else:
+            cmd += ["-map","0:v","-map","0:a?","-c:v","copy"]
 
-    vf_list = build_vf_list(preset, src_w, src_h)
-    if vf_list: cmd += ["-vf",",".join(vf_list)]
-    am = ["-map","0:v","-map","0:a"] if preset.get("_all_audio") else ["-map","0:v","-map","0:a?"]
-    cmd += am
+        if preset.get("_copy_subs"):
+            cmd += ["-map","0:s?","-c:s","copy"]
 
+        if not preset.get("_no_audio"):
+            ac = preset.get("audio_codec") or "aac"
+            ab = preset.get("audio_kbps")
+            if ac in ("copy","flac","pcm_s16le","pcm_s24le","pcm_s32le"):
+                cmd += ["-c:a", ac]
+                if "pcm" in ac: cmd += ["-ar","48000"]
+            else:
+                cmd += ["-c:a", ac]
+                if ab: cmd += ["-b:a", f"{ab}k"]
+                cmd += ["-ar","48000"]
+
+        if out_ext == ".mp4": cmd += ["-movflags","+faststart"]
+        cmd += [output_path]; return cmd
+
+    # ── Video filters ─────────────────────────────────────────────────
+    vf = build_vf_list(preset, src_w, src_h)
+    if vf: cmd += ["-vf",",".join(vf)]
+
+    # Stream mapping
+    if preset.get("_no_audio"):
+        cmd += ["-map","0:v","-an"]
+    elif preset.get("_all_audio"):
+        cmd += ["-map","0:v","-map","0:a"]
+    else:
+        cmd += ["-map","0:v","-map","0:a?"]
+    if preset.get("_copy_subs"):
+        cmd += ["-map","0:s?","-c:s","copy"]
+
+    # Video codec
     if co == "libx264":
         cmd += ["-c:v","libx264","-profile:v","high","-pix_fmt","yuv420p"]
     elif co == "libx265":
@@ -1134,29 +1443,38 @@ def build_cmd(input_path, output_path, preset, src_w, src_h,
     else:
         cmd += ["-c:v",co,"-pix_fmt","yuv420p"]
 
+    # Bitrate / CRF
     if video_kbps:
-        maxr = int(video_kbps*1.3); bufs = int(video_kbps*2.0)
-        cmd += ["-b:v",f"{video_kbps}k","-maxrate",f"{maxr}k","-bufsize",f"{bufs}k"]
+        mr = int(video_kbps*1.3); bs = int(video_kbps*2.0)
+        cmd += ["-b:v",f"{video_kbps}k","-maxrate",f"{mr}k","-bufsize",f"{bs}k"]
     elif preset.get("crf") is not None:
         cmd += ["-crf",str(preset["crf"])]
 
+    # Speed preset
     sp = preset.get("speed")
-    hw_names = {"nvenc","vaapi","qsv","videotoolbox","amf"}
-    if sp and not any(h in co for h in hw_names): cmd += ["-preset",sp]
+    if sp and not any(h in co for h in HW): cmd += ["-preset",sp]
 
+    # Two-pass
     if pass_num == 1:
         cmd += ["-pass","1","-passlogfile",passlog,"-an","-f","mp4","/dev/null"]
         return cmd
     elif pass_num == 2:
         cmd += ["-pass","2","-passlogfile",passlog]
 
-    ac = preset.get("audio_codec") or "aac"
-    ab = preset.get("audio_kbps") or 128
-    if ac == "copy":   cmd += ["-c:a","copy"]
-    elif ac == "flac": cmd += ["-c:a","flac"]
-    else:              cmd += ["-c:a",ac,"-b:a",f"{ab}k"]
-    cmd += ["-movflags","+faststart",output_path]
-    return cmd
+    # Audio
+    if not preset.get("_no_audio"):
+        ac = preset.get("audio_codec") or "aac"
+        ab = preset.get("audio_kbps")
+        if ac in ("copy","flac","pcm_s16le","pcm_s24le","pcm_s32le"):
+            cmd += ["-c:a", ac]
+            if "pcm" in ac: cmd += ["-ar","48000"]
+        else:
+            cmd += ["-c:a", ac]
+            if ab: cmd += ["-b:a", f"{ab}k"]
+            cmd += ["-ar","48000"]
+
+    if out_ext == ".mp4": cmd += ["-movflags","+faststart"]
+    cmd += [output_path]; return cmd
 
 # ════════════════════════════════════════════════════════════════════════
 # PROGRESS
@@ -1165,8 +1483,8 @@ def build_cmd(input_path, output_path, preset, src_w, src_h,
 def run_with_progress(cmd: List[str], duration_s: float, label: str = "Encoding") -> bool:
     with Progress(
         SpinnerColumn(),
-        TextColumn("[bold cyan]{task.description:<24}"),
-        BarColumn(bar_width=36,complete_style="cyan",finished_style="green"),
+        TextColumn("[bold cyan]{task.description:<26}"),
+        BarColumn(bar_width=34,complete_style="cyan",finished_style="green"),
         TaskProgressColumn(),
         TextColumn("[dim]{task.fields[eta]:<14}"),
         TextColumn("[dim]{task.fields[speed]}"),
@@ -1174,7 +1492,8 @@ def run_with_progress(cmd: List[str], duration_s: float, label: str = "Encoding"
     ) as prog:
         task = prog.add_task(label, total=100, eta="", speed="")
         try:
-            proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
+            proc = subprocess.Popen(cmd, stderr=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL, text=True)
         except FileNotFoundError:
             console.print("[red]  ffmpeg not found![/]"); return False
 
@@ -1184,47 +1503,56 @@ def run_with_progress(cmd: List[str], duration_s: float, label: str = "Encoding"
                 pct  = min(99.9, t/duration_s*100)
                 sm   = re.search(r"speed=\s*([\d.]+)x", line)
                 spd  = float(sm.group(1)) if sm else 0.0
-                sp_s = f"{spd:.1f}x" if spd > 0 else ""
-                rem  = (duration_s-t)/spd if spd > 0.01 else 0
+                sp_s = f"{spd:.1f}×" if spd>0 else ""
+                rem  = (duration_s-t)/spd if spd>0.01 else 0
                 eta  = f"ETA {human_dur(rem)}" if rem > 2 else ""
                 prog.update(task, completed=pct, speed=sp_s, eta=eta)
 
         proc.wait()
         if proc.returncode == 0:
-            prog.update(task, completed=100, eta="", speed="done")
+            prog.update(task, completed=100, eta="", speed="done ✓")
             return True
         prog.stop()
-        console.print(f"[red]  FFmpeg exited {proc.returncode}[/]")
+        console.print(f"[red]  ✗  FFmpeg exited {proc.returncode}[/]")
         return False
 
 # ════════════════════════════════════════════════════════════════════════
-# ENCODE — with HW fallback and post-encode size verification
+# ENCODE FILE (HW fallback + post-encode size verification)
 # ════════════════════════════════════════════════════════════════════════
 
-def encode_file(input_path, output_path, preset, info, idx=0, total=1) -> bool:
+def encode_file(input_path: str, output_path: str, preset: dict,
+                info: dict, idx: int = 0, total: int = 1) -> Tuple[bool, str]:
+    """Returns (success, actual_output_path)."""
     duration = file_duration(info)
     vs       = video_stream(info)
     src_w    = safe_int((vs or {}).get("width"))  if vs else None
     src_h    = safe_int((vs or {}).get("height")) if vs else None
     label_p  = f"[{idx}/{total}] " if total > 1 else ""
 
-    # Hardware encoder fallback
+    # Fix output extension for Resolve presets
+    out_ext = preset.get("_output_ext", ".mp4")
+    if not output_path.endswith(out_ext):
+        output_path = str(Path(output_path).with_suffix(out_ext))
+
+    # HW encoder fallback
     co = preset.get("codec") or "libx264"
-    hw_names = {"nvenc","vaapi","qsv","videotoolbox","amf"}
-    if any(h in co for h in hw_names):
-        preset = dict(preset)
-        preset["codec"] = hw_encoder_fallback(co, input_path)
+    HW = {"nvenc","vaapi","qsv","videotoolbox","amf"}
+    if any(h in co for h in HW):
+        preset = deepcopy(preset)
+        preset["codec"] = hw_fallback(co, input_path)
 
     # Percent target
     if preset.get("_pct") and file_size_bytes(info) > 0 and duration > 0:
-        preset = dict(preset)
+        preset = deepcopy(preset)
         preset["target_mb"] = file_size_bytes(info)/1024/1024 * preset["_pct"]
         console.print(f"  [dim]Target: {preset['target_mb']:.1f} MB ({preset['_pct']*100:.0f}% of original)[/]")
 
-    # Copy
+    # Copy path
     if preset.get("codec") == "copy":
         cmd = build_cmd(input_path, output_path, preset, src_w, src_h)
-        return run_with_progress(cmd, duration, f"{label_p}Remuxing")
+        output_path = cmd[-1]  # might have been updated with new ext
+        ok = run_with_progress(cmd, duration, f"{label_p}Remuxing")
+        return ok, output_path
 
     # Two-pass
     if preset.get("target_mb") and duration > 0:
@@ -1232,99 +1560,131 @@ def encode_file(input_path, output_path, preset, info, idx=0, total=1) -> bool:
         vkbps   = target_video_kbps(preset["target_mb"], duration, akbps, BITRATE_SAFETY)
         tmpdir  = tempfile.mkdtemp(prefix="fftoolbox_")
         passlog = os.path.join(tmpdir,"ff2pass")
+        est_mb  = (vkbps+akbps)*1000*duration/(8*1024*1024)
 
-        safe_target = preset["target_mb"] * BITRATE_SAFETY
-        est_mb = (vkbps+akbps)*1000*duration/(8*1024*1024)
+        safe_tgt = preset["target_mb"] * BITRATE_SAFETY
         console.print(
-            f"  [dim]Two-pass · user target {preset['target_mb']:.0f} MB · "
-            f"safety target {safe_target:.0f} MB · video {vkbps} kb/s · est. {est_mb:.1f} MB[/]"
+            f"  [dim]Two-pass  ·  user target [bold]{preset['target_mb']:.0f} MB[/]  ·  "
+            f"safety target [bold]{safe_tgt:.0f} MB[/]  ·  "
+            f"video {vkbps} kb/s  ·  est. [bold]{est_mb:.1f} MB[/][/]"
         )
 
         cmd1 = build_cmd(input_path, output_path, preset, src_w, src_h, vkbps, 1, passlog)
         ok = run_with_progress(cmd1, duration, f"{label_p}Pass 1/2")
         if ok:
             cmd2 = build_cmd(input_path, output_path, preset, src_w, src_h, vkbps, 2, passlog)
+            output_path = cmd2[-1]
             ok = run_with_progress(cmd2, duration, f"{label_p}Pass 2/2")
         try: shutil.rmtree(tmpdir)
         except: pass
 
-        # Post-encode verification
+        # Post-encode verification — retry if over budget
         if ok and os.path.exists(output_path):
-            actual_mb = os.path.getsize(output_path) / 1024 / 1024
-            user_target = preset["target_mb"]
-            if actual_mb > user_target:
-                over = actual_mb - user_target
+            actual_mb = os.path.getsize(output_path)/1024/1024
+            user_tgt  = preset["target_mb"]
+            if actual_mb > user_tgt:
+                over = actual_mb - user_tgt
                 console.print(
-                    f"  [yellow]! Output {actual_mb:.1f} MB is {over:.1f} MB over target {user_target:.0f} MB.[/]\n"
-                    f"  [dim]Rare edge case (B-frames, container). Re-encoding with tighter budget …[/]"
+                    f"  [yellow]⚠  Output {actual_mb:.1f} MB — {over:.1f} MB over target. "
+                    f"Auto-retrying at 90% margin …[/]"
                 )
-                # Re-encode with tighter budget (90% safety)
-                vkbps2   = target_video_kbps(user_target, duration, akbps, 0.90)
-                tmpdir2  = tempfile.mkdtemp(prefix="fftoolbox_")
-                passlog2 = os.path.join(tmpdir2,"ff2pass_retry")
-                cmd1r = build_cmd(input_path, output_path, preset, src_w, src_h, vkbps2, 1, passlog2)
-                ok2   = run_with_progress(cmd1r, duration, f"{label_p}Retry P1/2")
-                if ok2:
-                    cmd2r = build_cmd(input_path, output_path, preset, src_w, src_h, vkbps2, 2, passlog2)
-                    run_with_progress(cmd2r, duration, f"{label_p}Retry P2/2")
+                vkbps2   = target_video_kbps(user_tgt, duration, akbps, 0.90)
+                tmpdir2  = tempfile.mkdtemp(prefix="fftoolbox_retry_")
+                passlog2 = os.path.join(tmpdir2,"ff2pass")
+                c1 = build_cmd(input_path, output_path, preset, src_w, src_h, vkbps2, 1, passlog2)
+                r1 = run_with_progress(c1, duration, f"{label_p}Retry 1/2")
+                if r1:
+                    c2 = build_cmd(input_path, output_path, preset, src_w, src_h, vkbps2, 2, passlog2)
+                    output_path = c2[-1]
+                    run_with_progress(c2, duration, f"{label_p}Retry 2/2")
                 try: shutil.rmtree(tmpdir2)
                 except: pass
-        return ok
 
-    # CRF single-pass
+        return ok, output_path
+
+    # Single-pass CRF
     cmd = build_cmd(input_path, output_path, preset, src_w, src_h)
-    return run_with_progress(cmd, duration, f"{label_p}Encoding")
+    output_path = cmd[-1]
+    ok = run_with_progress(cmd, duration, f"{label_p}Encoding")
+    return ok, output_path
 
 # ════════════════════════════════════════════════════════════════════════
-# OUTPUT DIR
+# OUTPUT DIR PICKER
 # ════════════════════════════════════════════════════════════════════════
 
-def pick_output_dir(first_file: str) -> str:
+def pick_output_dir(first_file: str, history: Optional[Dict] = None) -> str:
     src     = Path(first_file).parent
-    beside  = str(src/"fftoolbox_output")
+    beside  = str(src / "fftoolbox_output")
     same    = str(src)
     desktop = os.path.expanduser("~/Desktop/fftoolbox_output")
+    last    = (history or {}).get("last_output_dir")
+
     console.print()
     console.print("[bold cyan]Output Directory[/]")
     console.print(f"  [cyan]1[/]  Subfolder beside source  [dim]{escape(beside)}[/]")
     console.print(f"  [cyan]2[/]  Same folder as source    [dim]{escape(same)}[/]")
     console.print(f"  [cyan]3[/]  Desktop                  [dim]{escape(desktop)}[/]")
-    console.print("  [cyan]4[/]  Custom path")
-    c = Prompt.ask("Choice", choices=["1","2","3","4"], default="1")
+    if last and last not in (beside, same, desktop):
+        console.print(f"  [cyan]4[/]  Last used                [dim]{escape(last)}[/]")
+        console.print("  [cyan]5[/]  Custom path")
+        choices = ["1","2","3","4","5"]
+    else:
+        console.print("  [cyan]4[/]  Custom path")
+        choices = ["1","2","3","4"]
+
+    c = Prompt.ask("Choice", choices=choices, default="1")
     if c=="1": return beside
     if c=="2": return same
     if c=="3": return desktop
+    if c=="4" and last and last not in (beside, same, desktop): return last
     return os.path.expanduser(Prompt.ask("Path").strip())
 
-def size_feedback(src_sz: int, dst_path: str, preset_key: str):
+# ════════════════════════════════════════════════════════════════════════
+# SIZE FEEDBACK
+# ════════════════════════════════════════════════════════════════════════
+
+def size_feedback(src_sz: int, dst_path: str, preset_key: str) -> None:
     try: dst_sz = os.path.getsize(dst_path)
     except: return
-    pct = (1-dst_sz/src_sz)*100 if src_sz > 0 else 0
+    pct = (1 - dst_sz/src_sz)*100 if src_sz > 0 else 0
     clr = "green" if pct > 5 else ("yellow" if pct > -5 else "red")
     direction = "smaller" if pct > 0 else "LARGER"
     console.print(
-        f"  [green]OK[/]  {human_size(src_sz)} → [{clr}]{human_size(dst_sz)}[/]"
+        f"  [green]✓[/]  {human_size(src_sz)} → [{clr}]{human_size(dst_sz)}[/]"
         f"  ({abs(pct):.1f}% {direction})"
     )
-    dst_mb = dst_sz/1024/1024
-    if preset_key == "whatsapp" and dst_mb > WHATSAPP_VIDEO_MB:
+    dst_mb = dst_sz / 1024 / 1024
+    if preset_key == "whatsapp" and dst_mb > WHATSAPP_MB:
         console.print(
-            f"\n  [bold yellow]! Output {dst_mb:.1f} MB — over WhatsApp's {WHATSAPP_VIDEO_MB} MB video limit.[/]\n"
-            "  [dim]Use [bold]Target File Size[/] at 95 MB, or send as a document in WhatsApp (no preview, up to 2 GB).[/]"
+            f"\n  [bold yellow]⚠  {dst_mb:.1f} MB > WhatsApp {WHATSAPP_MB} MB limit.[/]\n"
+            "  [dim]Use [bold]Target File Size[/] at 95 MB, or send as document (up to 2 GB, no preview).[/]"
         )
     elif dst_sz > src_sz and dst_sz-src_sz > 512*1024:
-        console.print("  [yellow]! Output is larger than input — source may already be well-compressed.[/]")
+        console.print("  [yellow]⚠  Output larger than input — source already well-compressed.[/]")
+
+# ════════════════════════════════════════════════════════════════════════
+# DETECT VIDEOS IN CWD
+# ════════════════════════════════════════════════════════════════════════
+
+def detect_cwd_media() -> Tuple[List[str], List[str]]:
+    """Returns (video_files, audio_files) in current working directory."""
+    cwd = Path.cwd()
+    vids = sorted(str(f) for f in cwd.iterdir()
+                  if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS)
+    auds = sorted(str(f) for f in cwd.iterdir()
+                  if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS)
+    return vids, auds
 
 # ════════════════════════════════════════════════════════════════════════
 # MAIN
 # ════════════════════════════════════════════════════════════════════════
 
 def main():
-    print_banner()
-
     # Background update check
-    import threading
-    threading.Thread(target=check_for_update, daemon=True).start()
+    threading.Thread(target=_check_update_bg, daemon=True).start()
+
+    print_banner()
+    show_update_banner()
 
     # Dependency check
     have_ffmpeg, have_ffprobe = check_deps()
@@ -1341,51 +1701,195 @@ def main():
 
     hw = detect_hw_encoders()
     if hw:
-        console.print("  [dim]Hardware encoders: " + ", ".join(l for _,l in hw[:3])
+        console.print("  [dim]⚡ Hardware: " + ", ".join(l for _,l in hw[:3])
                       + ("[/]" if len(hw)<=3 else f" +{len(hw)-3} more[/]"))
         console.print()
 
-    # ── STEP 1: Files ────────────────────────────────────────────────────
+    history = load_history()
+
+    # ════════════════════════════════════════════════════════════════════
+    # MAIN MENU — choose mode
+    # ════════════════════════════════════════════════════════════════════
+    cwd_vids, cwd_auds = detect_cwd_media()
+    cwd_media = cwd_vids + cwd_auds
+
+    console.print(Rule("[bold]What do you want to do?[/]"))
+    console.print()
+    console.print("  [cyan]1[/]  Convert video files  [dim](re-encode, compress, share)[/]")
+    console.print("  [cyan]2[/]  Extract audio from video  [dim](video → MP3/AAC/FLAC/…)[/]")
+    console.print("  [cyan]3[/]  Convert audio files  [dim](MP3 → FLAC, AAC → Opus, …)[/]")
+    console.print("  [cyan]4[/]  Fix for DaVinci Resolve Linux  [dim](audio codec fix, quick)[/]")
+
+    if cwd_media:
+        console.print()
+        console.print(
+            f"  [dim]📁 Found [bold]{len(cwd_media)}[/] media file(s) in current directory — "
+            f"use [bold]c[/] to select all[/]"
+        )
+
+    console.print()
+    mode_choices = ["1","2","3","4"]
+    if cwd_media: mode_choices.append("c")
+    mode = Prompt.ask("Mode", choices=mode_choices, default="1")
+
+    # Quick shortcut: use CWD files
+    if mode == "c":
+        mode = Prompt.ask(
+            "  Convert as [bold]video[/] (1), extract [bold]audio[/] (2), "
+            "[bold]Resolve fix[/] (4)?",
+            choices=["1","2","4"], default="1"
+        )
+        files_override = cwd_media
+    else:
+        files_override = None
+
+    # ════════════════════════════════════════════════════════════════════
+    # STEP 1 — File selection
+    # ════════════════════════════════════════════════════════════════════
+    console.print()
     console.print(Rule("[bold]Step 1 · Select File(s)[/]"))
     console.print()
-    console.print("  [cyan]1[/]  Browse interactively  [dim](type numbers OR paste paths directly)[/]")
-    console.print("  [cyan]2[/]  Paste file or directory path")
-    console.print("  [cyan]3[/]  Entire directory  (batch)")
-    sel = Prompt.ask("How", choices=["1","2","3"], default="1")
-    files: List[str] = []
 
-    if sel == "1":
-        result = file_browser(os.path.expanduser("~"))
-        if not result: console.print("[yellow]  Cancelled.[/]"); return
-        files = result
-    elif sel == "2":
-        raw = os.path.expanduser(Prompt.ask("Path").strip())
-        p = Path(raw)
-        if p.is_file(): files = [str(p)]
-        elif p.is_dir():
-            files = sorted(str(f) for f in p.iterdir()
-                          if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS)
-        else: console.print(f"[red]  Not found: {raw}[/]"); return
-    elif sel == "3":
-        raw = os.path.expanduser(Prompt.ask("Directory path").strip())
-        p = Path(raw)
-        if not p.is_dir(): console.print(f"[red]  Not a directory.[/]"); return
-        recursive = Confirm.ask("  Include subdirectories?", default=False)
-        glob = p.rglob("*") if recursive else p.iterdir()
-        files = sorted(str(f) for f in glob if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS)
+    if files_override:
+        files = files_override
+        console.print(f"  [green]✓[/]  Using [bold]{len(files)}[/] file(s) from current directory")
+        for f in files[:4]: console.print(f"  [dim]{escape(Path(f).name)}[/]")
+        if len(files)>4: console.print(f"  [dim]… and {len(files)-4} more[/]")
+    else:
+        audio_only_mode = (mode in ("2","3"))
+        console.print("  [cyan]1[/]  Browse interactively")
+        console.print("  [cyan]2[/]  Paste file or directory path")
+        console.print("  [cyan]3[/]  Entire folder  [dim](batch)[/]")
 
-    if not files: console.print("[red]  No video files found.[/]"); return
+        if history.get("recent_dirs"):
+            console.print(f"  [cyan]4[/]  Recent: [dim]{escape(history['recent_dirs'][0])}[/]")
+            sel_choices = ["1","2","3","4"]
+        else:
+            sel_choices = ["1","2","3"]
+
+        sel = Prompt.ask("How", choices=sel_choices, default="1")
+        files: List[str] = []
+
+        if sel == "1":
+            start = (history.get("recent_dirs") or [os.path.expanduser("~")])[0]
+            result = file_browser(start, history=history, audio_mode=audio_only_mode)
+            if not result: console.print("[yellow]  Cancelled.[/]"); return
+            files = result
+        elif sel == "2":
+            raw = os.path.expanduser(Prompt.ask("Path").strip())
+            p   = Path(raw)
+            ext = ALL_MEDIA if audio_only_mode else (VIDEO_EXTENSIONS | AUDIO_EXTENSIONS)
+            if p.is_file():
+                files = [str(p)]
+            elif p.is_dir():
+                files = sorted(str(f) for f in p.iterdir()
+                               if f.is_file() and f.suffix.lower() in ext)
+            else:
+                console.print(f"[red]  Not found: {raw}[/]"); return
+        elif sel == "3":
+            raw = os.path.expanduser(Prompt.ask("Directory path").strip())
+            p   = Path(raw)
+            if not p.is_dir(): console.print("[red]  Not a directory.[/]"); return
+            recursive = Confirm.ask("  Include subdirectories?", default=False)
+            ext = ALL_MEDIA if audio_only_mode else (VIDEO_EXTENSIONS | AUDIO_EXTENSIONS)
+            g   = p.rglob("*") if recursive else p.iterdir()
+            files = sorted(str(f) for f in g if f.is_file() and f.suffix.lower() in ext)
+        elif sel == "4" and history.get("recent_dirs"):
+            d = history["recent_dirs"][0]
+            ext = ALL_MEDIA if audio_only_mode else (VIDEO_EXTENSIONS | AUDIO_EXTENSIONS)
+            files = sorted(str(f) for f in Path(d).iterdir()
+                          if f.is_file() and f.suffix.lower() in ext)
+            console.print(f"  [dim]{len(files)} file(s) from {escape(d)}[/]")
+
+    if not files: console.print("[red]  No files found.[/]"); return
     files = sorted(set(files))
-    console.print(f"\n  [green]OK[/]  [bold]{len(files)} file(s) selected[/]")
-    for f in files[:5]: console.print(f"  [dim]{escape(f)}[/]")
-    if len(files) > 5: console.print(f"  [dim]… and {len(files)-5} more[/]")
+    console.print(f"\n  [green]✓[/]  [bold]{len(files)} file(s) selected[/]")
+    for f in files[:4]: console.print(f"  [dim]{escape(f)}[/]")
+    if len(files)>4: console.print(f"  [dim]… +{len(files)-4} more[/]")
 
+    # Probe first file
     console.print()
     first_info = run_ffprobe(files[0])
     if first_info: print_file_info(first_info, files[0])
     else: console.print("[yellow]  Could not read media info.[/]")
 
-    # ── STEP 2: Preset ───────────────────────────────────────────────────
+    infos: Dict[str, Optional[dict]] = {files[0]: first_info}
+
+    # ════════════════════════════════════════════════════════════════════
+    # Output directory
+    # ════════════════════════════════════════════════════════════════════
+    output_dir = pick_output_dir(files[0], history)
+    try: os.makedirs(output_dir, exist_ok=True)
+    except OSError as e: console.print(f"[red]  Cannot create output dir: {e}[/]"); return
+    console.print(f"  [green]✓[/]  Output: [dim]{escape(output_dir)}[/]")
+
+    # ════════════════════════════════════════════════════════════════════
+    # AUDIO EXTRACTION / CONVERSION (modes 2 & 3)
+    # ════════════════════════════════════════════════════════════════════
+    if mode == "2":
+        s, f = extract_audio(files, infos, output_dir)
+        console.print()
+        console.print(Rule("[bold]Summary[/]"))
+        console.print(f"  [green]{s} succeeded[/]" + (f"  [red]{f} failed[/]" if f else ""))
+        console.print(f"\n  [bold]Output:[/] [cyan]{escape(output_dir)}[/]")
+        add_to_history(history, files, output_dir)
+        return
+
+    if mode == "3":
+        audio_files = [f for f in files if Path(f).suffix.lower() in AUDIO_EXTENSIONS]
+        if not audio_files:
+            console.print("[red]  No audio files selected.[/]"); return
+        s, f = convert_audio(audio_files, output_dir)
+        console.print()
+        console.print(Rule("[bold]Summary[/]"))
+        console.print(f"  [green]{s} succeeded[/]" + (f"  [red]{f} failed[/]" if f else ""))
+        console.print(f"\n  [bold]Output:[/] [cyan]{escape(output_dir)}[/]")
+        add_to_history(history, files, output_dir)
+        return
+
+    # ════════════════════════════════════════════════════════════════════
+    # RESOLVE QUICK FIX (mode 4)
+    # ════════════════════════════════════════════════════════════════════
+    if mode == "4":
+        console.print()
+        console.print(Rule("[bold]🔧  DaVinci Resolve Linux Audio Fix[/]"))
+        preset      = deepcopy(PRESETS["resolve_audio_fix"])
+        preset      = configure_preset("resolve_audio_fix", preset, first_info)
+        selected_key = "resolve_audio_fix"
+
+        console.print()
+        if not Confirm.ask("[bold]Fix audio on all selected files now?[/]", default=True):
+            console.print("[yellow]  Cancelled.[/]"); return
+
+        success, failed = 0, 0
+        for i, fpath in enumerate(files, 1):
+            fi = infos.get(fpath) or run_ffprobe(fpath); infos[fpath] = fi
+            if not fi:
+                console.print(f"  [{i}] [red]Cannot read: {escape(Path(fpath).name)}[/]")
+                failed += 1; continue
+            console.print(f"\n  [bold][{i}/{len(files)}][/]  {escape(Path(fpath).name)}")
+            out_name = f"{Path(fpath).stem}_resolve_fix.mov"
+            out_path = os.path.join(output_dir, out_name)
+            out_path = _unique_path(out_path)
+            ok, out_path = encode_file(fpath, out_path, preset, fi, i, len(files))
+            if ok and os.path.exists(out_path):
+                size_feedback(file_size_bytes(fi), out_path, selected_key)
+                console.print(f"  [dim]{escape(out_path)}[/]")
+                success += 1
+            else:
+                failed += 1
+
+        console.print()
+        console.print(Rule("[bold]Summary[/]"))
+        console.print(f"  [green]{success} fixed[/]" + (f"  [red]{failed} failed[/]" if failed else ""))
+        console.print(f"\n  [bold]Output:[/] [cyan]{escape(output_dir)}[/]")
+        console.print("  [dim]Import the .mov files into DaVinci Resolve — audio should work now.[/]")
+        add_to_history(history, files, output_dir)
+        return
+
+    # ════════════════════════════════════════════════════════════════════
+    # VIDEO CONVERSION (mode 1) — preset selection
+    # ════════════════════════════════════════════════════════════════════
     console.print()
     console.print(Rule("[bold]Step 2 · Choose Preset[/]"))
     console.print()
@@ -1394,132 +1898,134 @@ def main():
 
     preset_keys  = list(PRESETS.keys())
     suggested_no = str(preset_keys.index(suggested)+1)
-    valid_nos    = [str(i) for i in range(1,len(preset_keys)+1)]
 
-    raw_choice = Prompt.ask("Preset number (or 'i' to import)", default=suggested_no).strip().lower()
+    raw_c = Prompt.ask("Preset # (or 'i' to import)", default=suggested_no).strip().lower()
 
-    if raw_choice == "i":
+    if raw_c == "i":
         imported = import_preset_menu()
         if not imported: console.print("[yellow]  Import cancelled.[/]"); return
-        selected_key = "_imported"
-        preset       = imported
-    else:
-        if raw_choice not in valid_nos:
-            console.print("[red]  Invalid choice.[/]"); return
-        selected_key = preset_keys[int(raw_choice)-1]
-        preset       = dict(PRESETS[selected_key])
+        selected_key = "_imported"; preset = imported
+    elif raw_c.isdigit() and 1 <= int(raw_c) <= len(preset_keys):
+        selected_key = preset_keys[int(raw_c)-1]
+        preset       = deepcopy(PRESETS[selected_key])
         tip = preset.get("tip","")
-        if tip: console.print(f"\n  [dim]{tip}[/]")
+        if tip: console.print(f"\n  [dim]💡 {tip}[/]")
         preset = configure_preset(selected_key, preset, first_info)
+    else:
+        console.print("[red]  Invalid choice.[/]"); return
 
     color = preset.get("color","cyan")
-    console.print(f"\n  [green]OK[/]  [{color}]{preset.get('emoji','')} {preset.get('name','Custom')}[/]")
+    console.print(f"\n  [green]✓[/]  [{color}]{preset.get('emoji','')} {preset.get('name','Custom')}[/]")
 
-    # Preview encode option
+    # Preview option (single file only)
     console.print()
     if len(files) == 1 and first_info and preset.get("codec") != "copy":
-        if Confirm.ask("  Run a 5-second preview encode first?", default=False):
-            if not run_preview_encode(files[0], preset, first_info):
-                console.print("[yellow]  Cancelled after preview.[/]"); return
+        if Confirm.ask("  Run a 5-second preview encode with quality estimate?", default=False):
+            if not run_preview(files[0], preset, first_info):
+                console.print("[yellow]  Cancelled.[/]"); return
 
-    # ── STEP 3: Output dir ───────────────────────────────────────────────
-    output_dir = pick_output_dir(files[0])
-    try: os.makedirs(output_dir, exist_ok=True)
-    except OSError as e: console.print(f"[red]  Cannot create output dir: {e}[/]"); return
-    console.print(f"  [green]OK[/]  Output: [dim]{escape(output_dir)}[/]")
-
-    # ── STEP 4: Plan ─────────────────────────────────────────────────────
+    # ── Encode plan ──────────────────────────────────────────────────────
     console.print()
     console.print(Rule("[bold]Encode Plan[/]"))
+    sfx     = (selected_key if selected_key not in ("_imported","custom")
+               else "custom")
+    out_ext = preset.get("_output_ext",".mp4")
+
     plan_tbl = Table(box=box.SIMPLE, padding=(0,1))
-    plan_tbl.add_column("File",     max_width=34, overflow="fold")
+    plan_tbl.add_column("File",     max_width=32, overflow="fold")
     plan_tbl.add_column("Size",     style="dim", width=10)
     plan_tbl.add_column("Duration", style="dim", width=10)
     plan_tbl.add_column("Res",      style="dim", width=12)
     plan_tbl.add_column("Output",   max_width=28, overflow="fold")
-    infos: Dict[str,Optional[dict]] = {files[0]: first_info}
     total_src = 0
+
     for f in files:
         fi = infos.get(f) or run_ffprobe(f); infos[f] = fi
-        out = f"{Path(f).stem}_{selected_key if selected_key != '_imported' else 'custom'}.mp4"
+        out = f"{Path(f).stem}_{sfx}{out_ext}"
         if fi:
-            sz=file_size_bytes(fi); dur=file_duration(fi)
-            vs=video_stream(fi); w=(vs or {}).get("width","?"); h=(vs or {}).get("height","?")
+            sz  = file_size_bytes(fi); dur = file_duration(fi)
+            vs  = video_stream(fi)
+            w   = (vs or {}).get("width","?"); h = (vs or {}).get("height","?")
             total_src += sz
-            plan_tbl.add_row(Path(f).name, human_size(sz), human_dur(dur), f"{w}x{h}", out)
+            plan_tbl.add_row(Path(f).name, human_size(sz), human_dur(dur), f"{w}×{h}", out)
         else:
             plan_tbl.add_row(Path(f).name,"?","?","?",out)
+
     console.print(plan_tbl)
-    if total_src > 0: console.print(f"  [dim]Total input: {human_size(total_src)}[/]")
+    if total_src > 0:
+        console.print(f"  [dim]Total input: {human_size(total_src)}[/]")
 
     console.print()
-    if not Confirm.ask("[bold]Start encoding now?[/]", default=True):
+    if not Confirm.ask("[bold]Start encoding?[/]", default=True):
         console.print("[yellow]  Cancelled.[/]"); return
 
-    # ── STEP 5: Encode ───────────────────────────────────────────────────
+    # ── Encode ───────────────────────────────────────────────────────────
     console.print()
     console.print(Rule("[bold cyan]Encoding[/]"))
     success, failed = 0, 0
     results: List[Tuple[str,str,int,int]] = []
-    sfx = selected_key if selected_key != "_imported" else "custom"
 
     for i, fpath in enumerate(files, 1):
         console.print()
         console.print(f"  [bold][{i}/{len(files)}][/]  {escape(Path(fpath).name)}")
+
         fi = infos.get(fpath) or run_ffprobe(fpath)
         if not fi:
-            console.print("  [red]  Could not read — skipping[/]"); failed += 1; continue
+            console.print("  [red]  Cannot read file — skipping[/]"); failed += 1; continue
 
-        file_preset = dict(preset)
-        if preset.get("_pct") and file_size_bytes(fi) > 0:
+        # Per-file percent target
+        file_preset = deepcopy(preset)
+        if preset.get("_pct") and file_size_bytes(fi) > 0 and file_duration(fi) > 0:
             file_preset["target_mb"] = file_size_bytes(fi)/1024/1024 * preset["_pct"]
 
-        out_name = f"{Path(fpath).stem}_{sfx}.mp4"
+        out_name = f"{Path(fpath).stem}_{sfx}{out_ext}"
         out_path = os.path.join(output_dir, out_name)
 
-        # Collision handling
         if os.path.exists(out_path):
             out_path = handle_collision(out_path)
             if out_path is None:
                 console.print("  [dim]  Skipped.[/]"); continue
 
         try:
-            ok = encode_file(fpath, out_path, file_preset, fi, i, len(files))
+            ok, out_path = encode_file(fpath, out_path, file_preset, fi, i, len(files))
         except Exception as exc:
             console.print(f"  [red]  Error: {exc}[/]")
             if os.environ.get("FFTOOLBOX_DEBUG"):
                 console.print(f"  [dim]{traceback.format_exc()}[/]")
-            ok = False
+            ok = False; out_path = out_path or ""
 
         if ok and os.path.exists(out_path):
-            src_sz = file_size_bytes(fi)
-            dst_sz = os.path.getsize(out_path)
+            src_sz = file_size_bytes(fi); dst_sz = os.path.getsize(out_path)
             size_feedback(src_sz, out_path, selected_key)
             console.print(f"  [dim]{escape(out_path)}[/]")
-            success += 1
-            results.append((fpath, out_path, src_sz, dst_sz))
+            success += 1; results.append((fpath, out_path, src_sz, dst_sz))
         else:
             failed += 1
 
-    # ── STEP 6: Summary ──────────────────────────────────────────────────
+    # ── Summary ──────────────────────────────────────────────────────────
     console.print()
     console.print(Rule("[bold]Summary[/]"))
-    parts = [f"[green]{success} succeeded[/]"]
-    if failed: parts.append(f"[red]{failed} failed[/]")
+    parts = [f"[green]✓ {success} succeeded[/]"]
+    if failed: parts.append(f"[red]✗ {failed} failed[/]")
     console.print("  " + "  |  ".join(parts))
+
     if results:
-        tin  = sum(r[2] for r in results)
-        tout = sum(r[3] for r in results)
-        saved = tin-tout
-        pct = (saved/tin*100) if tin > 0 else 0
-        clr = "green" if saved > 0 else "yellow"
+        tin   = sum(r[2] for r in results)
+        tout  = sum(r[3] for r in results)
+        saved = tin - tout
+        pct   = (saved/tin*100) if tin > 0 else 0
+        clr   = "green" if saved > 0 else "yellow"
         console.print(
             f"  Total  {human_size(tin)} → [{clr}]{human_size(tout)}[/]"
             + (f"  [green](saved {human_size(saved)}, {pct:.1f}%)[/]" if saved > 0
                else f"  [yellow](+{human_size(-saved)} larger)[/]")
         )
+
     console.print(f"\n  [bold]Output:[/] [cyan]{escape(output_dir)}[/]")
+
+    add_to_history(history, files, output_dir)
     console.print()
+
 
 if __name__ == "__main__":
     try:
