@@ -62,7 +62,7 @@ console = Console(highlight=False)
 # CONSTANTS
 # ════════════════════════════════════════════════════════════════════════
 
-APP_VERSION     = "1.3"
+APP_VERSION     = "1.4"
 APP_NAME        = "fftoolbox"
 GITHUB_OWNER    = "oskar26"
 GITHUB_REPO     = "FFToolbox"
@@ -1713,7 +1713,11 @@ def run_with_progress(cmd: List[str], duration_s: float, label: str = "Encoding"
         except FileNotFoundError:
             console.print("[red]  ffmpeg not found![/]"); return False
 
+        stderr_lines: List[str] = []
         for line in proc.stderr:
+            stderr_lines.append(line.rstrip())
+            if len(stderr_lines) > 30:          # keep last 30 lines
+                stderr_lines.pop(0)
             t = parse_progress_time(line)
             if t and duration_s > 0:
                 pct  = min(99.9, t/duration_s*100)
@@ -1728,8 +1732,14 @@ def run_with_progress(cmd: List[str], duration_s: float, label: str = "Encoding"
         if proc.returncode == 0:
             prog.update(task, completed=100, eta="", speed="done ✓")
             return True
+
         prog.stop()
         console.print(f"[red]  ✗  FFmpeg exited {proc.returncode}[/]")
+        # Show the last meaningful error lines from stderr
+        error_lines = [l for l in stderr_lines if l.strip() and not l.startswith("frame=")]
+        if error_lines:
+            for l in error_lines[-4:]:
+                console.print(f"  [dim red]{escape(l)}[/]")
         return False
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1990,14 +2000,24 @@ def size_feedback(src_sz: int, dst_path: str, preset_key: str) -> None:
 # DETECT VIDEOS IN CWD
 # ════════════════════════════════════════════════════════════════════════
 
-def detect_cwd_media() -> Tuple[List[str], List[str]]:
-    """Returns (video_files, audio_files) in current working directory."""
+def detect_cwd_media() -> Tuple[List[str], List[str], int]:
+    """
+    Returns (video_files, audio_files, subdir_count) for current working directory.
+    Only scans the top level — subdir count tells the user there is more below.
+    """
     cwd = Path.cwd()
     vids = sorted(str(f) for f in cwd.iterdir()
                   if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS)
     auds = sorted(str(f) for f in cwd.iterdir()
                   if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS)
-    return vids, auds
+    # Count subdirs that contain media (for the hint)
+    subdirs_with_media = sum(
+        1 for d in cwd.iterdir()
+        if d.is_dir() and not d.name.startswith(".")
+        and any(True for f in d.rglob("*")
+                if f.is_file() and f.suffix.lower() in (VIDEO_EXTENSIONS | AUDIO_EXTENSIONS))
+    )
+    return vids, auds, subdirs_with_media
 
 # ════════════════════════════════════════════════════════════════════════
 # MAIN
@@ -2034,7 +2054,7 @@ def main():
     # ════════════════════════════════════════════════════════════════════
     # MAIN MENU — choose mode
     # ════════════════════════════════════════════════════════════════════
-    cwd_vids, cwd_auds = detect_cwd_media()
+    cwd_vids, cwd_auds, cwd_subdirs = detect_cwd_media()
     cwd_media = cwd_vids + cwd_auds
 
     console.print(Rule("[bold]What do you want to do?[/]"))
@@ -2045,24 +2065,27 @@ def main():
     console.print("  [cyan]4[/]  Fix for DaVinci Resolve Linux  [dim](audio codec fix, quick)[/]")
     console.print("  [cyan]u[/]  Check for updates  [dim](github.com/oskar26/FFToolbox)[/]")
 
-    if cwd_media:
+    if cwd_media or cwd_subdirs:
         console.print()
+        hint_parts = []
+        if cwd_media:
+            hint_parts.append(f"[bold]{len(cwd_media)}[/] file(s) here")
+        if cwd_subdirs:
+            hint_parts.append(f"[bold]{cwd_subdirs}[/] subdir(s) with media below")
         console.print(
-            f"  [dim]📁 Found [bold]{len(cwd_media)}[/] media file(s) in current directory — "
-            f"use [bold]c[/] to select all[/]"
+            f"  [dim]📁 Found {' + '.join(hint_parts)} — "
+            f"[bold]c[/] = use all (with subdir option)[/]"
         )
 
     console.print()
     mode_choices = ["1","2","3","4","u"]
-    if cwd_media: mode_choices.append("c")
+    if cwd_media or cwd_subdirs: mode_choices.append("c")
     mode = Prompt.ask("Mode", choices=mode_choices, default="1")
 
     # Update trigger from within the app
     if mode == "u":
-        # Give background thread a moment to finish if it hasn't
         time.sleep(0.3)
         if not _update_info.available:
-            # Fetch synchronously since user explicitly asked
             with console.status("[cyan]Checking GitHub for updates …[/]"):
                 _fetch_update_info()
         if _update_info.available:
@@ -2071,14 +2094,38 @@ def main():
             console.print(f"\n  [green]✓  You are on the latest version (v{APP_VERSION}).[/]")
         return
 
-    # Quick shortcut: use CWD files
+    # ── c shortcut: use current directory (with optional recursive) ────────
     if mode == "c":
         mode = Prompt.ask(
             "  Convert as [bold]video[/] (1), extract [bold]audio[/] (2), "
             "[bold]Resolve fix[/] (4)?",
             choices=["1","2","4"], default="1"
         )
-        files_override = cwd_media
+        cwd = Path.cwd()
+        ext = ALL_MEDIA if mode in ("2","3") else (VIDEO_EXTENSIONS | AUDIO_EXTENSIONS)
+
+        if cwd_subdirs:
+            console.print(
+                f"\n  [dim]Found {len(cwd_media)} file(s) here "
+                f"+ {cwd_subdirs} subdir(s) with more media.[/]"
+            )
+            go_recursive = Confirm.ask(
+                "  Include all subdirectories (recursive)?", default=True
+            )
+        else:
+            go_recursive = False
+
+        if go_recursive:
+            files_override = sorted(
+                str(f) for f in cwd.rglob("*")
+                if f.is_file() and f.suffix.lower() in ext
+                and "_originals" not in f.parts   # skip backup folders
+            )
+        else:
+            files_override = sorted(
+                str(f) for f in cwd.iterdir()
+                if f.is_file() and f.suffix.lower() in ext
+            )
     else:
         files_override = None
 
@@ -2091,9 +2138,27 @@ def main():
 
     if files_override:
         files = files_override
-        console.print(f"  [green]✓[/]  Using [bold]{len(files)}[/] file(s) from current directory")
-        for f in files[:4]: console.print(f"  [dim]{escape(Path(f).name)}[/]")
-        if len(files)>4: console.print(f"  [dim]… and {len(files)-4} more[/]")
+        if not files:
+            console.print("[red]  No media files found.[/]"); return
+        cwd = Path.cwd()
+        console.print(f"  [green]✓[/]  [bold]{len(files)}[/] file(s) selected from current directory")
+        # Group by subdir for display
+        by_dir: Dict[str, List[str]] = {}
+        for f in files:
+            parent = str(Path(f).parent)
+            by_dir.setdefault(parent, []).append(Path(f).name)
+        shown = 0
+        for d, fnames in sorted(by_dir.items())[:4]:
+            try:
+                rel = str(Path(d).relative_to(cwd))
+            except ValueError:
+                rel = d
+            label = "." if rel == "." else rel
+            preview = ", ".join(fnames[:3]) + ("…" if len(fnames) > 3 else "")
+            console.print(f"  [dim]{escape(label)}/  →  {escape(preview)}[/]")
+            shown += 1
+        if len(by_dir) > 4:
+            console.print(f"  [dim]… and {len(by_dir)-4} more subdirectories[/]")
     else:
         audio_only_mode = (mode in ("2","3"))
         console.print("  [cyan]1[/]  Browse interactively")
@@ -2226,20 +2291,34 @@ def main():
                 failed += 1; continue
             console.print(f"\n  [bold][{i}/{len(files)}][/]  {escape(Path(fpath).name)}")
 
-            out_path = out_cfg.output_path_for(fpath, "resolve_fix", ".mov")
+            out_path        = out_cfg.output_path_for(fpath, "resolve_fix", ".mov")
+            src_for_encode  = fpath   # default: encode from original
 
             if out_cfg.mode == "inplace_backup":
                 bak = out_cfg.prepare_inplace_backup(fpath)
-                if bak: console.print(f"  [dim]  backed up → {escape(Path(bak).name)}[/]")
+                if bak is None:
+                    console.print("  [red]  Backup failed — skipping to protect original.[/]")
+                    failed += 1; continue
+                console.print(f"  [dim]  backed up → {escape(Path(bak).name)}[/]")
+                src_for_encode = bak   # ← encode FROM the backup, write TO original path
 
-            out_path = _unique_path(out_path) if os.path.exists(out_path) and out_cfg.mode == "subfolder" else out_path
+            elif out_cfg.mode == "subfolder" and os.path.exists(out_path):
+                out_path = _unique_path(out_path)
 
-            ok, out_path = encode_file(fpath, out_path, preset, fi, i, len(files))
+            ok, out_path = encode_file(src_for_encode, out_path, preset, fi, i, len(files))
             if ok and os.path.exists(out_path):
                 size_feedback(file_size_bytes(fi), out_path, selected_key)
                 console.print(f"  [dim]{escape(out_path)}[/]")
                 success += 1
             else:
+                # Restore backup if encode failed
+                if out_cfg.mode == "inplace_backup" and 'bak' in dir() and bak and os.path.exists(bak):
+                    try:
+                        shutil.move(bak, fpath)
+                        console.print("  [yellow]  Encode failed — original restored from backup.[/]")
+                    except Exception as e:
+                        console.print(f"  [red]  Encode failed & restore failed: {escape(str(e))}[/]")
+                        console.print(f"  [yellow]  Your original is at: {escape(bak)}[/]")
                 failed += 1
 
         console.print()
@@ -2452,11 +2531,46 @@ if __name__ == "__main__":
         _ensure_rich()
         from rich.console import Console as _C; _c = _C(highlight=False)
         _c.print(f"\n[bold cyan]fftoolbox[/] [dim]v{APP_VERSION}[/]  — checking for updates …\n")
-        _fetch_update_info()          # run synchronously when called explicitly
+        _fetch_update_info()
         if _update_info.available:
             perform_update(interactive=True)
         else:
             _c.print(f"[green]✓  You are on the latest version (v{APP_VERSION}).[/]\n")
+        sys.exit(0)
+
+    if "--restore" in sys.argv:
+        # Restore backed-up originals from _originals/ subfolder(s)
+        _ensure_rich()
+        from rich.console import Console as _C; _c = _C(highlight=False)
+        _c.print(f"\n[bold cyan]fftoolbox[/]  —  [bold yellow]Restore from backup[/]\n")
+        cwd = Path.cwd()
+        backup_dirs = list(cwd.rglob("_originals"))
+        backup_dirs = [d for d in backup_dirs if d.is_dir()]
+        if not backup_dirs:
+            _c.print(f"  [yellow]No _originals/ folders found under {cwd}[/]")
+            sys.exit(0)
+        restored = 0
+        for bak_dir in backup_dirs:
+            target_dir = bak_dir.parent
+            _c.print(f"\n  [dim]{escape(str(bak_dir))}[/]")
+            for f in sorted(bak_dir.iterdir()):
+                if not f.is_file(): continue
+                dest = target_dir / f.name
+                if dest.exists():
+                    _c.print(f"  [yellow]  skip (exists): {escape(f.name)}[/]")
+                    continue
+                try:
+                    shutil.move(str(f), str(dest))
+                    _c.print(f"  [green]  ✓[/]  {escape(f.name)}")
+                    restored += 1
+                except Exception as e:
+                    _c.print(f"  [red]  ✗  {escape(f.name)}: {e}[/]")
+            # Remove _originals dir if now empty
+            try:
+                bak_dir.rmdir()
+            except Exception:
+                pass
+        _c.print(f"\n[green]Restored {restored} file(s).[/]\n")
         sys.exit(0)
 
     try:
