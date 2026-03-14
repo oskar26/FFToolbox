@@ -1828,32 +1828,140 @@ def encode_file(input_path: str, output_path: str, preset: dict,
 # OUTPUT DIR PICKER
 # ════════════════════════════════════════════════════════════════════════
 
-def pick_output_dir(first_file: str, history: Optional[Dict] = None) -> str:
-    src     = Path(first_file).parent
-    beside  = str(src / "fftoolbox_output")
-    same    = str(src)
+class OutputConfig:
+    """Encapsulates where and how outputs are written."""
+    mode:          str  = "subfolder"   # subfolder | same | desktop | custom | inplace | inplace_backup
+    base_dir:      str  = ""            # absolute output root (unused for inplace modes)
+    batch_root:    Optional[str] = None # root of recursive batch; None = flat output
+    backup_suffix: str  = "_originals"  # folder name for backed-up originals
+
+    def output_path_for(self, src_path: str, sfx: str, ext: str) -> str:
+        """
+        Compute the output file path for src_path.
+
+        - inplace:        overwrite src in-place (no backup)
+        - inplace_backup: move original to <parent>/_originals/, write new to original location
+        - otherwise:      write to base_dir, preserving subdir structure if batch_root is set
+        """
+        src = Path(src_path)
+
+        if self.mode in ("inplace", "inplace_backup"):
+            return str(src.with_suffix(ext))
+
+        # Preserve subfolder structure when batch_root is known
+        if self.batch_root:
+            try:
+                rel = src.parent.relative_to(self.batch_root)
+                out_parent = Path(self.base_dir) / rel
+            except ValueError:
+                out_parent = Path(self.base_dir)
+        else:
+            out_parent = Path(self.base_dir)
+
+        out_parent.mkdir(parents=True, exist_ok=True)
+        return str(out_parent / f"{src.stem}_{sfx}{ext}")
+
+    def prepare_inplace_backup(self, src_path: str) -> Optional[str]:
+        """
+        For inplace_backup mode: move original to _originals/ subfolder.
+        Returns the backup path, or None on failure.
+        """
+        if self.mode != "inplace_backup":
+            return None
+        src     = Path(src_path)
+        bak_dir = src.parent / self.backup_suffix
+        bak_dir.mkdir(exist_ok=True)
+        bak_path = _unique_path(str(bak_dir / src.name))
+        try:
+            shutil.move(str(src), bak_path)
+            return bak_path
+        except Exception as e:
+            console.print(f"  [red]  Could not backup original: {e}[/]")
+            return None
+
+
+def pick_output_mode(files: List[str], history: Optional[Dict] = None) -> OutputConfig:
+    """
+    Ask user how/where to write outputs.
+    Returns an OutputConfig describing the chosen strategy.
+    """
+    cfg = OutputConfig()
+
+    # Detect batch root (common ancestor of all files)
+    if len(files) > 1:
+        parents = [Path(f).parent for f in files]
+        try:
+            common = Path(os.path.commonpath([str(p) for p in parents]))
+        except ValueError:
+            common = parents[0]
+        cfg.batch_root = str(common)
+    else:
+        cfg.batch_root = None
+
+    first   = files[0]
+    src_dir = Path(first).parent
+    beside  = str(src_dir / "fftoolbox_output")
     desktop = os.path.expanduser("~/Desktop/fftoolbox_output")
     last    = (history or {}).get("last_output_dir")
 
+    # Build batch root label
+    root_label = ""
+    if cfg.batch_root and len(files) > 1:
+        root_label = f"  [dim](subfolder structure preserved under {escape(cfg.batch_root)})[/]"
+
     console.print()
-    console.print("[bold cyan]Output Directory[/]")
-    console.print(f"  [cyan]1[/]  Subfolder beside source  [dim]{escape(beside)}[/]")
-    console.print(f"  [cyan]2[/]  Same folder as source    [dim]{escape(same)}[/]")
-    console.print(f"  [cyan]3[/]  Desktop                  [dim]{escape(desktop)}[/]")
-    if last and last not in (beside, same, desktop):
-        console.print(f"  [cyan]4[/]  Last used                [dim]{escape(last)}[/]")
+    console.print("[bold cyan]Output Mode[/]")
+    console.print(f"  [cyan]1[/]  Subfolder beside source [dim]{escape(beside)}[/]{root_label}")
+    console.print(f"  [cyan]2[/]  Desktop                 [dim]{escape(desktop)}[/]")
+    console.print()
+    console.print("  [cyan]3[/]  [bold]In-place — replace originals[/]  [dim](originals moved to _originals/ first)[/]")
+    console.print("  [cyan]4[/]  [bold]In-place — overwrite[/]          [dim](no backup, careful!)[/]")
+    console.print()
+    if last and last not in (beside, desktop):
+        console.print(f"  [cyan]5[/]  Last used  [dim]{escape(last)}[/]")
+        console.print("  [cyan]6[/]  Custom path")
+        choices = ["1","2","3","4","5","6"]
+    else:
         console.print("  [cyan]5[/]  Custom path")
         choices = ["1","2","3","4","5"]
-    else:
-        console.print("  [cyan]4[/]  Custom path")
-        choices = ["1","2","3","4"]
 
     c = Prompt.ask("Choice", choices=choices, default="1")
-    if c=="1": return beside
-    if c=="2": return same
-    if c=="3": return desktop
-    if c=="4" and last and last not in (beside, same, desktop): return last
-    return os.path.expanduser(Prompt.ask("Path").strip())
+
+    if c == "1":
+        cfg.mode     = "subfolder"
+        cfg.base_dir = beside
+    elif c == "2":
+        cfg.mode     = "subfolder"
+        cfg.base_dir = desktop
+    elif c == "3":
+        cfg.mode = "inplace_backup"
+        backup_name = Prompt.ask(
+            "  Backup folder name", default="_originals"
+        ).strip() or "_originals"
+        cfg.backup_suffix = backup_name
+        console.print(
+            f"  [dim]Originals → [bold]<source_dir>/{backup_name}/[/] · "
+            "converted files replace them in the original location[/]"
+        )
+        return cfg
+    elif c == "4":
+        if not Confirm.ask(
+            "  [bold red]Overwrite originals with no backup?[/]", default=False
+        ):
+            console.print("  [dim]Switched to in-place with backup.[/]")
+            cfg.mode = "inplace_backup"
+        else:
+            cfg.mode = "inplace"
+        return cfg
+    elif c == "5" and last and last not in (beside, desktop):
+        cfg.mode     = "subfolder"
+        cfg.base_dir = last
+    else:
+        cfg.mode     = "subfolder"
+        cfg.base_dir = os.path.expanduser(Prompt.ask("Path").strip())
+
+    os.makedirs(cfg.base_dir, exist_ok=True)
+    return cfg
 
 # ════════════════════════════════════════════════════════════════════════
 # SIZE FEEDBACK
@@ -2047,12 +2155,30 @@ def main():
     infos: Dict[str, Optional[dict]] = {files[0]: first_info}
 
     # ════════════════════════════════════════════════════════════════════
-    # Output directory
+    # Output mode
     # ════════════════════════════════════════════════════════════════════
-    output_dir = pick_output_dir(files[0], history)
-    try: os.makedirs(output_dir, exist_ok=True)
-    except OSError as e: console.print(f"[red]  Cannot create output dir: {e}[/]"); return
-    console.print(f"  [green]✓[/]  Output: [dim]{escape(output_dir)}[/]")
+    out_cfg = pick_output_mode(files, history)
+
+    # For audio modes we always use a flat output dir (no in-place needed)
+    if mode in ("2", "3"):
+        flat_dir = out_cfg.base_dir if out_cfg.mode == "subfolder" else str(
+            Path(files[0]).parent / "fftoolbox_output")
+        os.makedirs(flat_dir, exist_ok=True)
+        console.print(f"  [green]✓[/]  Output: [dim]{escape(flat_dir)}[/]")
+
+    elif out_cfg.mode == "subfolder":
+        console.print(f"  [green]✓[/]  Output: [dim]{escape(out_cfg.base_dir)}[/]")
+        if out_cfg.batch_root and len(files) > 1:
+            console.print(f"  [dim]  Subfolder structure preserved from: {escape(out_cfg.batch_root)}[/]")
+    elif out_cfg.mode == "inplace_backup":
+        console.print(
+            f"  [green]✓[/]  In-place  ·  originals → [bold]<dir>/{out_cfg.backup_suffix}/[/]"
+        )
+    elif out_cfg.mode == "inplace":
+        console.print("  [bold yellow]✓  In-place overwrite (no backup)[/]")
+
+    # legacy alias used by audio sub-modes
+    output_dir = flat_dir if mode in ("2","3") else (out_cfg.base_dir or "")
 
     # ════════════════════════════════════════════════════════════════════
     # AUDIO EXTRACTION / CONVERSION (modes 2 & 3)
@@ -2099,9 +2225,15 @@ def main():
                 console.print(f"  [{i}] [red]Cannot read: {escape(Path(fpath).name)}[/]")
                 failed += 1; continue
             console.print(f"\n  [bold][{i}/{len(files)}][/]  {escape(Path(fpath).name)}")
-            out_name = f"{Path(fpath).stem}_resolve_fix.mov"
-            out_path = os.path.join(output_dir, out_name)
-            out_path = _unique_path(out_path)
+
+            out_path = out_cfg.output_path_for(fpath, "resolve_fix", ".mov")
+
+            if out_cfg.mode == "inplace_backup":
+                bak = out_cfg.prepare_inplace_backup(fpath)
+                if bak: console.print(f"  [dim]  backed up → {escape(Path(bak).name)}[/]")
+
+            out_path = _unique_path(out_path) if os.path.exists(out_path) and out_cfg.mode == "subfolder" else out_path
+
             ok, out_path = encode_file(fpath, out_path, preset, fi, i, len(files))
             if ok and os.path.exists(out_path):
                 size_feedback(file_size_bytes(fi), out_path, selected_key)
@@ -2113,9 +2245,9 @@ def main():
         console.print()
         console.print(Rule("[bold]Summary[/]"))
         console.print(f"  [green]{success} fixed[/]" + (f"  [red]{failed} failed[/]" if failed else ""))
-        console.print(f"\n  [bold]Output:[/] [cyan]{escape(output_dir)}[/]")
+        console.print(f"\n  [bold]Output:[/] [cyan]{escape(out_cfg.base_dir or '(in-place)')}[/]")
         console.print("  [dim]Import the .mov files into DaVinci Resolve — audio should work now.[/]")
-        add_to_history(history, files, output_dir)
+        add_to_history(history, files, out_cfg.base_dir or str(Path(files[0]).parent))
         return
 
     # ════════════════════════════════════════════════════════════════════
@@ -2158,33 +2290,44 @@ def main():
     # ── Encode plan ──────────────────────────────────────────────────────
     console.print()
     console.print(Rule("[bold]Encode Plan[/]"))
-    sfx     = (selected_key if selected_key not in ("_imported","custom")
-               else "custom")
+    sfx     = (selected_key if selected_key not in ("_imported","custom") else "custom")
     out_ext = preset.get("_output_ext",".mp4")
 
     plan_tbl = Table(box=box.SIMPLE, padding=(0,1))
-    plan_tbl.add_column("File",     max_width=32, overflow="fold")
+    plan_tbl.add_column("File",     max_width=30, overflow="fold")
     plan_tbl.add_column("Size",     style="dim", width=10)
     plan_tbl.add_column("Duration", style="dim", width=10)
     plan_tbl.add_column("Res",      style="dim", width=12)
-    plan_tbl.add_column("Output",   max_width=28, overflow="fold")
+    plan_tbl.add_column("→ Output", max_width=30, overflow="fold")
     total_src = 0
 
     for f in files:
         fi = infos.get(f) or run_ffprobe(f); infos[f] = fi
-        out = f"{Path(f).stem}_{sfx}{out_ext}"
+        out_preview = out_cfg.output_path_for(f, sfx, out_ext)
+        out_label   = (
+            f"[dim](in-place)[/]"
+            if out_cfg.mode in ("inplace","inplace_backup")
+            else escape(Path(out_preview).name)
+        )
         if fi:
             sz  = file_size_bytes(fi); dur = file_duration(fi)
             vs  = video_stream(fi)
             w   = (vs or {}).get("width","?"); h = (vs or {}).get("height","?")
             total_src += sz
-            plan_tbl.add_row(Path(f).name, human_size(sz), human_dur(dur), f"{w}×{h}", out)
+            plan_tbl.add_row(Path(f).name, human_size(sz), human_dur(dur), f"{w}×{h}", out_label)
         else:
-            plan_tbl.add_row(Path(f).name,"?","?","?",out)
+            plan_tbl.add_row(Path(f).name,"?","?","?",out_label)
 
     console.print(plan_tbl)
     if total_src > 0:
         console.print(f"  [dim]Total input: {human_size(total_src)}[/]")
+    if out_cfg.mode == "inplace_backup":
+        console.print(
+            f"  [bold yellow]⚠  Originals will be moved to "
+            f"<dir>/{out_cfg.backup_suffix}/ before encoding.[/]"
+        )
+    elif out_cfg.mode == "inplace":
+        console.print("  [bold red]⚠  Originals will be overwritten with no backup![/]")
 
     console.print()
     if not Confirm.ask("[bold]Start encoding?[/]", default=True):
@@ -2198,7 +2341,15 @@ def main():
 
     for i, fpath in enumerate(files, 1):
         console.print()
-        console.print(f"  [bold][{i}/{len(files)}][/]  {escape(Path(fpath).name)}")
+        # Show relative path when we have a batch root
+        if out_cfg.batch_root:
+            try:
+                display_name = str(Path(fpath).relative_to(out_cfg.batch_root))
+            except ValueError:
+                display_name = Path(fpath).name
+        else:
+            display_name = Path(fpath).name
+        console.print(f"  [bold][{i}/{len(files)}][/]  {escape(display_name)}")
 
         fi = infos.get(fpath) or run_ffprobe(fpath)
         if not fi:
@@ -2209,28 +2360,63 @@ def main():
         if preset.get("_pct") and file_size_bytes(fi) > 0 and file_duration(fi) > 0:
             file_preset["target_mb"] = file_size_bytes(fi)/1024/1024 * preset["_pct"]
 
-        out_name = f"{Path(fpath).stem}_{sfx}{out_ext}"
-        out_path = os.path.join(output_dir, out_name)
+        src_sz = file_size_bytes(fi)
 
-        if os.path.exists(out_path):
-            out_path = handle_collision(out_path)
-            if out_path is None:
-                console.print("  [dim]  Skipped.[/]"); continue
+        # For in-place modes: backup original first, then encode to original path
+        if out_cfg.mode == "inplace_backup":
+            bak = out_cfg.prepare_inplace_backup(fpath)
+            if bak is None:
+                console.print("  [red]  Backup failed — skipping to protect original.[/]")
+                failed += 1; continue
+            console.print(f"  [dim]  → backup: {escape(Path(bak).name)}[/]")
+            # Encode from the backup (original was moved there)
+            src_for_encode = bak
+            out_path       = out_cfg.output_path_for(fpath, sfx, out_ext)
+        elif out_cfg.mode == "inplace":
+            src_for_encode = fpath
+            out_path       = out_cfg.output_path_for(fpath, sfx, out_ext)
+            # Encode to a temp file first, then move over original on success
+            tmp_out = out_path + ".fftoolbox_tmp" + out_ext
+            out_path = tmp_out
+        else:
+            src_for_encode = fpath
+            out_path       = out_cfg.output_path_for(fpath, sfx, out_ext)
+            if os.path.exists(out_path):
+                out_path = handle_collision(out_path)
+                if out_path is None:
+                    console.print("  [dim]  Skipped.[/]"); continue
 
         try:
-            ok, out_path = encode_file(fpath, out_path, file_preset, fi, i, len(files))
+            ok, out_path = encode_file(src_for_encode, out_path, file_preset, fi, i, len(files))
         except Exception as exc:
             console.print(f"  [red]  Error: {exc}[/]")
             if os.environ.get("FFTOOLBOX_DEBUG"):
                 console.print(f"  [dim]{traceback.format_exc()}[/]")
             ok = False; out_path = out_path or ""
 
+        # For inplace overwrite: move temp file over original on success
+        if out_cfg.mode == "inplace" and ok and out_path.endswith(".fftoolbox_tmp" + out_ext):
+            final_path = out_cfg.output_path_for(fpath, sfx, out_ext)
+            try:
+                shutil.move(out_path, final_path)
+                out_path = final_path
+            except Exception as e:
+                console.print(f"  [red]  Could not finalize: {e}[/]")
+                ok = False
+
         if ok and os.path.exists(out_path):
-            src_sz = file_size_bytes(fi); dst_sz = os.path.getsize(out_path)
+            dst_sz = os.path.getsize(out_path)
             size_feedback(src_sz, out_path, selected_key)
             console.print(f"  [dim]{escape(out_path)}[/]")
             success += 1; results.append((fpath, out_path, src_sz, dst_sz))
         else:
+            # If inplace_backup failed after backup, restore original
+            if out_cfg.mode == "inplace_backup" and 'bak' in dir() and bak and os.path.exists(bak):
+                try:
+                    shutil.move(bak, fpath)
+                    console.print(f"  [yellow]  Encode failed — original restored.[/]")
+                except Exception:
+                    console.print(f"  [red]  Encode failed & could not restore: {escape(bak)}[/]")
             failed += 1
 
     # ── Summary ──────────────────────────────────────────────────────────
@@ -2252,9 +2438,11 @@ def main():
                else f"  [yellow](+{human_size(-saved)} larger)[/]")
         )
 
-    console.print(f"\n  [bold]Output:[/] [cyan]{escape(output_dir)}[/]")
+    out_summary = out_cfg.base_dir if out_cfg.mode == "subfolder" else "(in-place)"
+    console.print(f"\n  [bold]Output:[/] [cyan]{escape(out_summary)}[/]")
 
-    add_to_history(history, files, output_dir)
+    add_to_history(history, files,
+                   out_cfg.base_dir or str(Path(files[0]).parent))
     console.print()
 
 
