@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║           fftoolbox Pro  v1.2  —  Smart Media Converter          ║
+║           fftoolbox Pro  v1.3  —  Smart Media Converter          ║
 ║  Video · Audio Extraction · Audio Conversion · DaVinci Fix       ║
 ╚══════════════════════════════════════════════════════════════════╝
 
@@ -11,7 +11,7 @@ Install as system command:
   fftoolbox
 
 Requirements: Python 3.8+  ·  ffmpeg + ffprobe in PATH
-License: MIT  ·  https://github.com/yourusername/fftoolbox
+License: MIT  ·  https://github.com/oskar26/FFToolbox
 """
 
 import sys, os, re, json, time, shutil, tempfile, subprocess, traceback, threading
@@ -62,10 +62,15 @@ console = Console(highlight=False)
 # CONSTANTS
 # ════════════════════════════════════════════════════════════════════════
 
-APP_VERSION    = "1.2"
-APP_NAME       = "fftoolbox"
-GITHUB_RAW_URL = "https://raw.githubusercontent.com/yourusername/fftoolbox/main/VERSION"
-CONFIG_DIR     = Path.home() / ".config" / "fftoolbox"
+APP_VERSION     = "1.3"
+APP_NAME        = "fftoolbox"
+GITHUB_OWNER    = "oskar26"
+GITHUB_REPO     = "FFToolbox"
+GITHUB_BRANCH   = "main"
+GITHUB_API_URL  = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/{GITHUB_BRANCH}"
+GITHUB_SCRIPT   = f"{GITHUB_RAW_BASE}/fftoolbox_pro.py"
+CONFIG_DIR      = Path.home() / ".config" / "fftoolbox"
 PRESETS_DIR    = CONFIG_DIR / "presets"
 HISTORY_FILE   = CONFIG_DIR / "history.json"
 BITRATE_SAFETY = 0.94   # 94% — ensures output is always UNDER user's target
@@ -811,26 +816,237 @@ def import_preset_menu() -> Optional[Dict[str, Any]]:
 # AUTO-UPDATER (background)
 # ════════════════════════════════════════════════════════════════════════
 
-_UPDATE_MSG: Optional[str] = None
 
-def _check_update_bg():
-    global _UPDATE_MSG
+# ════════════════════════════════════════════════════════════════════════
+# AUTO-UPDATER
+# ════════════════════════════════════════════════════════════════════════
+
+class UpdateInfo:
+    """Holds the result of an update check (filled by background thread)."""
+    available:    bool          = False
+    remote_ver:   str           = ""
+    changelog:    str           = ""
+    download_url: str           = ""
+    error:        Optional[str] = None
+
+_update_info = UpdateInfo()
+
+
+def _version_tuple(v: str) -> Tuple[int, ...]:
+    """Convert '1.2.3' → (1, 2, 3) for comparison."""
     try:
-        req = Request(GITHUB_RAW_URL, headers={"User-Agent": f"fftoolbox/{APP_VERSION}"})
-        with urlopen(req, timeout=2) as r:
-            remote = r.read().decode().strip()
-        if remote and remote != APP_VERSION:
-            _UPDATE_MSG = remote
-    except: pass
+        return tuple(int(x) for x in re.split(r"[.\-]", v.lstrip("v")) if x.isdigit())
+    except Exception:
+        return (0,)
 
-def show_update_banner():
-    if _UPDATE_MSG:
-        console.print(Panel(
-            f"[bold yellow]Update available: v{_UPDATE_MSG}[/]  (you have v{APP_VERSION})\n"
-            "[dim]https://github.com/yourusername/fftoolbox[/]",
-            border_style="yellow", title="[yellow]Update[/]",
-        ))
+
+def _fetch_update_info() -> None:
+    """Background thread: query GitHub Releases API and fill _update_info."""
+    global _update_info
+    try:
+        req = Request(
+            GITHUB_API_URL,
+            headers={
+                "User-Agent":  f"fftoolbox/{APP_VERSION}",
+                "Accept":      "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        with urlopen(req, timeout=4) as r:
+            data = json.loads(r.read().decode())
+
+        tag          = data.get("tag_name", "").lstrip("v")
+        body         = data.get("body",     "")   # release notes / changelog
+        assets       = data.get("assets",   [])
+
+        # Look for a .py asset first, fall back to raw GitHub URL
+        script_asset = next(
+            (a["browser_download_url"] for a in assets
+             if a.get("name","").endswith(".py")),
+            GITHUB_SCRIPT,
+        )
+
+        if tag and _version_tuple(tag) > _version_tuple(APP_VERSION):
+            _update_info.available    = True
+            _update_info.remote_ver   = tag
+            _update_info.changelog    = body.strip()
+            _update_info.download_url = script_asset
+
+    except URLError:
+        pass   # no network — silently skip
+    except Exception as e:
+        _update_info.error = str(e)
+
+
+def _start_update_check() -> None:
+    threading.Thread(target=_fetch_update_info, daemon=True).start()
+
+
+def show_update_banner() -> None:
+    """Called after banner — shows a notice if an update is waiting."""
+    if not _update_info.available:
+        return
+
+    lines = [
+        f"[bold yellow]Update available:[/] v{_update_info.remote_ver}  "
+        f"[dim](you have v{APP_VERSION})[/]",
+    ]
+    if _update_info.changelog:
+        # Show first 3 non-empty lines of release notes
+        notes = [l for l in _update_info.changelog.splitlines() if l.strip()][:3]
+        for n in notes:
+            lines.append(f"[dim]  {escape(n)}[/]")
+
+    lines.append(f"\n[dim]Run [bold]fftoolbox --update[/] or type [bold]u[/] at the main menu.[/]")
+    console.print(Panel("\n".join(lines), border_style="yellow",
+                        title="[bold yellow]⬆  Update[/]"))
+    console.print()
+
+
+def perform_update(interactive: bool = True) -> bool:
+    """
+    Download the latest release script from GitHub and replace the running script.
+
+    Steps:
+      1. Download new script to a temp file
+      2. Verify it's valid Python (ast.parse)
+      3. Check it contains a newer APP_VERSION string
+      4. Back up the current script
+      5. Replace (handles /usr/local/bin/ via sudo if needed)
+      6. Re-exec the new version
+
+    Returns True if update was applied, False otherwise.
+    """
+    import ast, stat, hashlib
+
+    url  = _update_info.download_url if _update_info.available else GITHUB_SCRIPT
+    ver  = _update_info.remote_ver   if _update_info.available else "latest"
+
+    if interactive:
         console.print()
+        console.print(Rule("[bold yellow]⬆  Auto-Updater[/]"))
+        console.print(
+            f"\n  Downloading [bold]v{ver}[/] from:\n"
+            f"  [dim]{url}[/]\n"
+        )
+
+        if _update_info.changelog:
+            notes = [l for l in _update_info.changelog.splitlines() if l.strip()][:6]
+            tbl = Table(box=box.ROUNDED, border_style="dim", show_header=False, padding=(0,1))
+            tbl.add_column("", style="dim")
+            for n in notes:
+                tbl.add_row(escape(n))
+            console.print(Panel(tbl, title="[dim]Release Notes[/]", border_style="dim"))
+
+        if not Confirm.ask(f"  Install v{ver} now?", default=True):
+            console.print("  [yellow]Update cancelled.[/]")
+            return False
+
+    # ── Download ──────────────────────────────────────────────────────
+    try:
+        console.print("  [dim]Downloading …[/]", end=" ")
+        req = Request(url, headers={"User-Agent": f"fftoolbox/{APP_VERSION}"})
+        with urlopen(req, timeout=30) as r:
+            new_code = r.read()
+        console.print("[green]done[/]")
+    except Exception as e:
+        console.print(f"\n  [red]Download failed: {e}[/]")
+        return False
+
+    # ── Verify: valid Python ──────────────────────────────────────────
+    try:
+        ast.parse(new_code)
+    except SyntaxError as e:
+        console.print(f"  [red]Downloaded file has syntax error: {e} — aborting.[/]")
+        return False
+
+    # ── Verify: contains newer version tag ───────────────────────────
+    code_str = new_code.decode("utf-8", errors="replace")
+    m = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', code_str)
+    if not m:
+        console.print("  [red]Cannot find APP_VERSION in downloaded file — aborting.[/]")
+        return False
+    new_ver_str = m.group(1)
+    if _version_tuple(new_ver_str) <= _version_tuple(APP_VERSION):
+        console.print(
+            f"  [yellow]Downloaded version ({new_ver_str}) is not newer "
+            f"than current ({APP_VERSION}) — nothing to do.[/]"
+        )
+        return False
+
+    # ── SHA256 checksum display ───────────────────────────────────────
+    sha256 = hashlib.sha256(new_code).hexdigest()
+    console.print(f"  [dim]SHA-256: {sha256[:16]}…[/]")
+
+    # ── Locate the running script ─────────────────────────────────────
+    script_path = Path(os.path.abspath(__file__))
+    backup_path = script_path.with_suffix(f".v{APP_VERSION}.bak")
+
+    console.print(f"  [dim]Script:  {script_path}[/]")
+    console.print(f"  [dim]Backup:  {backup_path}[/]")
+
+    # ── Write to temp file ────────────────────────────────────────────
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".py") as tf:
+        tf.write(new_code)
+        tmp_path = tf.name
+
+    # ── Replace — handle read-only locations (e.g. /usr/local/bin) ───
+    def _try_replace() -> bool:
+        try:
+            shutil.copy2(script_path, backup_path)   # backup
+            shutil.move(tmp_path, script_path)       # replace
+            os.chmod(script_path,
+                     os.stat(script_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            return True
+        except PermissionError:
+            return False
+
+    if not _try_replace():
+        # Try sudo cp
+        console.print(
+            f"\n  [yellow]No write permission to {script_path}.[/]\n"
+            "  [dim]Trying with sudo (you may be asked for your password) …[/]"
+        )
+        try:
+            subprocess.run(
+                ["sudo", "cp", tmp_path, str(script_path)],
+                check=True,
+            )
+            subprocess.run(
+                ["sudo", "chmod", "+x", str(script_path)],
+                check=True,
+            )
+            # backup via sudo too
+            subprocess.run(
+                ["sudo", "cp", str(script_path), str(backup_path)],
+                check=False,
+            )
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+        except subprocess.CalledProcessError:
+            console.print(
+                "  [red]sudo failed. Try manually:[/]\n"
+                f"  [bold]sudo cp {tmp_path} {script_path}[/]\n"
+                f"  [bold]sudo chmod +x {script_path}[/]"
+            )
+            return False
+
+    console.print(
+        f"\n  [bold green]✓  Updated to v{new_ver_str}![/]  "
+        f"[dim](backup: {backup_path.name})[/]"
+    )
+
+    # ── Re-exec ───────────────────────────────────────────────────────
+    console.print("  [dim]Restarting …[/]\n")
+    time.sleep(0.5)
+    try:
+        os.execv(sys.executable, [sys.executable, str(script_path)] + sys.argv[1:])
+    except Exception:
+        console.print("  [yellow]Could not restart automatically. Please re-run fftoolbox.[/]")
+    return True
+
 
 # ════════════════════════════════════════════════════════════════════════
 # UI HELPERS
@@ -1681,7 +1897,7 @@ def detect_cwd_media() -> Tuple[List[str], List[str]]:
 
 def main():
     # Background update check
-    threading.Thread(target=_check_update_bg, daemon=True).start()
+    _start_update_check()
 
     print_banner()
     show_update_banner()
@@ -1719,6 +1935,7 @@ def main():
     console.print("  [cyan]2[/]  Extract audio from video  [dim](video → MP3/AAC/FLAC/…)[/]")
     console.print("  [cyan]3[/]  Convert audio files  [dim](MP3 → FLAC, AAC → Opus, …)[/]")
     console.print("  [cyan]4[/]  Fix for DaVinci Resolve Linux  [dim](audio codec fix, quick)[/]")
+    console.print("  [cyan]u[/]  Check for updates  [dim](github.com/oskar26/FFToolbox)[/]")
 
     if cwd_media:
         console.print()
@@ -1728,9 +1945,23 @@ def main():
         )
 
     console.print()
-    mode_choices = ["1","2","3","4"]
+    mode_choices = ["1","2","3","4","u"]
     if cwd_media: mode_choices.append("c")
     mode = Prompt.ask("Mode", choices=mode_choices, default="1")
+
+    # Update trigger from within the app
+    if mode == "u":
+        # Give background thread a moment to finish if it hasn't
+        time.sleep(0.3)
+        if not _update_info.available:
+            # Fetch synchronously since user explicitly asked
+            with console.status("[cyan]Checking GitHub for updates …[/]"):
+                _fetch_update_info()
+        if _update_info.available:
+            perform_update(interactive=True)
+        else:
+            console.print(f"\n  [green]✓  You are on the latest version (v{APP_VERSION}).[/]")
+        return
 
     # Quick shortcut: use CWD files
     if mode == "c":
@@ -2028,6 +2259,18 @@ def main():
 
 
 if __name__ == "__main__":
+    # ── CLI flags ────────────────────────────────────────────────────────
+    if "--update" in sys.argv or "-u" in sys.argv:
+        _ensure_rich()
+        from rich.console import Console as _C; _c = _C(highlight=False)
+        _c.print(f"\n[bold cyan]fftoolbox[/] [dim]v{APP_VERSION}[/]  — checking for updates …\n")
+        _fetch_update_info()          # run synchronously when called explicitly
+        if _update_info.available:
+            perform_update(interactive=True)
+        else:
+            _c.print(f"[green]✓  You are on the latest version (v{APP_VERSION}).[/]\n")
+        sys.exit(0)
+
     try:
         main()
     except KeyboardInterrupt:
